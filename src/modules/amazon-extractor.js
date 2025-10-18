@@ -299,6 +299,60 @@ const extractMainImage = () => {
   return null;
 };
 
+const extractReviewHelpfulCount = (text) => {
+  const cleaned = clean(text);
+  if (!cleaned) return null;
+  if (/One person/i.test(cleaned)) {
+    return 1;
+  }
+  const match = cleaned.match(/([\d,]+)/);
+  if (!match) return null;
+  const value = parseInt(match[1].replace(/,/g, ''), 10);
+  return Number.isFinite(value) ? value : null;
+};
+
+const extractReviews = () => {
+  const reviews = [];
+  const reviewNodes = document.querySelectorAll('#cm-cr-dp-review-list li[data-hook="review"]');
+
+  reviewNodes.forEach((node) => {
+    const id = node.getAttribute('id') || null;
+    const card = node.querySelector('[id^="customer_review-"]') || node;
+
+    const titleNode = node.querySelector('[data-hook="review-title"] span');
+    const bodyNode = node.querySelector('[data-hook="review-body"]');
+    const ratingNode = node.querySelector('[data-hook="review-star-rating"] span');
+    const dateNode = node.querySelector('[data-hook="review-date"]');
+    const formatNode = node.querySelector('[data-hook="format-strip-linkless"]');
+    const badges = Array.from(node.querySelectorAll('[data-hook="avp-badge-linkless"], .cr-badge-text'))
+      .map(el => clean(el.textContent))
+      .filter(Boolean);
+    const helpfulNode = node.querySelector('[data-hook="helpful-vote-statement"], [data-hook="review-voting-count"]');
+
+    const authorNode = node.querySelector('.a-profile-name');
+
+    const review = {
+      id,
+      selector: id ? `#${id}` : (card?.id ? `#${card.id}` : null),
+      title: clean(titleNode?.textContent),
+      body: clean(bodyNode?.textContent),
+      rating: ratingNode ? parseFloat((clean(ratingNode.textContent)?.match(/[\d.]+/) || [])[0]) || null : null,
+      date: clean(dateNode?.textContent),
+      format: clean(formatNode?.textContent),
+      helpfulCount: extractReviewHelpfulCount(helpfulNode?.textContent || ''),
+      badges,
+      author: clean(authorNode?.textContent)
+    };
+
+    // Skip totally empty reviews
+    if (review.title || review.body) {
+      reviews.push(review);
+    }
+  });
+
+  return reviews.slice(0, 8);
+};
+
 // Export as global for content script
 window.extractAmazonProduct = () => {
   try {
@@ -347,7 +401,7 @@ window.extractAmazonProduct = () => {
       specs: techSpecs,
       bullets,
       description,
-      reviews: [], // Reviews extraction would require scrolling/pagination
+      reviews: extractReviews(),
       availability,
       variations: { hasVariations: false, types: [] }, // TODO: Extract from twister data
       badges,

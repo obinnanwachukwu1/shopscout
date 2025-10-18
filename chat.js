@@ -114,7 +114,7 @@ async function handleSendMessage() {
     const response = await chrome.runtime.sendMessage({
       type: 'USER_QUESTION',
       question: message,
-      context: currentProduct
+      context: { productData: currentProduct }
     });
 
     if (response.success && response.data) {

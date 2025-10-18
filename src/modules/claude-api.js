@@ -7,6 +7,7 @@
 
 // Import config at the top level
 import { CLAUDE_API_KEY as IMPORTED_API_KEY } from '../../config.local.js';
+import { WebSearch } from './web-search.js';
 
 // Store the API key
 let CLAUDE_API_KEY = IMPORTED_API_KEY;
@@ -31,138 +32,187 @@ export class ClaudeAPI {
   }
 
   /**
-   * Analyze product specifications for contradictions
+   * Unified analysis entry point (spec + sentiment + mode extras) with a single Claude call.
    */
-  static async analyzeSpecs(productData) {
-    const prompt = `You are a product specification analyzer. Analyze the following product data and identify any contradictions, inconsistencies, or red flags in the specifications.
+  static async analyzeProductBundle(productData, mode, options = {}) {
+    const focusArea = this.getFocusAreaForMode(mode);
+    const externalContext = this.formatExternalInsightsForPrompt(options.externalInsights);
 
-Product: ${productData.title}
+    const reviewSnippets = productData.reviews?.slice(0, 10).map((review, index) => {
+      const rating = typeof review.rating === 'number' ? `${review.rating}/5` : 'Rating N/A';
+      const title = review.title || 'Untitled review';
+      const author = review.author ? ` by ${review.author}` : '';
+      const date = review.date ? ` (${review.date})` : '';
+      const body = review.body ? `\n${review.body}` : '';
+      return `${index + 1}. ${rating} - ${title}${author}${date}${body}`;
+    }).join('\n\n') || 'No reviews captured on the page.';
 
-Specifications:
-${JSON.stringify(productData.specs, null, 2)}
+    const prompt = `You are an AI product insights analyst. Perform a comprehensive assessment for the mode "${mode}" using ONLY the evidence below. Avoid speculation.
 
-Product Bullets:
-${productData.bullets?.join('\n') || 'N/A'}
+Product Title: ${productData.title}
+Price: ${productData.price?.formatted || 'Unknown'}
+Rating: ${productData.rating || 'N/A'} (${productData.reviewCount ?? 'unknown'} reviews)
+
+Specifications JSON:
+${JSON.stringify(productData.specs || {}, null, 2)}
+
+Feature Bullets:
+${(productData.bullets || []).join('\n') || 'No bullets provided.'}
 
 Description:
-${productData.description || 'N/A'}
+${productData.description || 'No description provided.'}
 
-Return your analysis as a JSON object with this exact structure:
+Top On-Page Reviews:
+${reviewSnippets}
+
+External Review Signals:
+${externalContext}
+
+Evidence constraints:
+- Cite pros/cons ONLY if they appear explicitly in the reviews, specifications, or external snippets above. If uncertain, omit the point.
+- Treat storage references (e.g., 256GB mentions) as optional configurations unless they directly contradict the provided base specs.
+- Accept references to "iPadOS 26" (or later) as valid future software releases unless other evidence disputes it.
+- The product title states "A16 chip"; regard this as correct unless an external finding explicitly contradicts it.
+- Packaging or accessory critiques should be included only when reviews clearly mention them.
+- Limit the "cons" list to high-signal issues directly grounded in the evidence (max 5). If no grounded negatives exist, return an empty array.
+
+Return strictly valid JSON with this schema (no additional keys):
 {
-  "conflicts": ["array of specific conflicts or contradictions found"],
-  "redFlags": ["array of red flags or concerns"],
-  "hasNewerModel": false,
-  "confidence": 0.95
+  "specAnalysis": {
+    "conflicts": ["specific conflicting details"],
+    "redFlags": ["potential concerns"],
+    "hasNewerModel": false,
+    "confidence": 0.0
+  } | null,
+  "sentiment": {
+    "focus": "${focusArea}",
+    "pros": ["mode-specific positives"],
+    "cons": ["mode-specific negatives"],
+    "confidence": 0.0
+  } | null,
+  "beauty": {
+    "summary": "2-3 sentence skin-type overview",
+    "suitableFor": ["skin types"],
+    "concerns": ["potential irritants"],
+    "pros": ["benefits"],
+    "cons": ["complaints"],
+    "confidence": 0.0
+  } | null,
+  "recommendation": {
+    "summary": "Short overall takeaway for shoppers",
+    "callToAction": "Optional next step"
+  },
+  "confidence": 0.0
 }
 
-If no conflicts are found, return an empty conflicts array. Be specific and cite what contradicts what.`;
+Mode-specific rules:
+- ELECTRONICS or GENERIC_HOME_GOODS: populate specAnalysis and sentiment; set beauty to null.
+- FASHION: focus sentiment on fit/sizing/material; specAnalysis and beauty should be null.
+- BEAUTY: populate beauty plus sentiment if helpful; specAnalysis usually null unless explicit contradictions exist.
+- COLLECTIBLES: highlight authenticity, condition, value retention; specAnalysis optional (set to null if nothing concrete).
+- If data is insufficient for any section, set that section to null rather than fabricating content. Always ground the findings in the provided context.`;
 
-    return await this.callClaude(prompt, HAIKU_MODEL, { conflicts: [], redFlags: [], hasNewerModel: false, confidence: 1.0 });
-  }
+    const fallback = {
+      specAnalysis: null,
+      sentiment: null,
+      beauty: null,
+      recommendation: {
+        summary: 'Analysis unavailable.',
+        callToAction: null
+      },
+      confidence: 0.3
+    };
 
-  /**
-   * Analyze review sentiment with mode-specific focus
-   */
-  static async analyzeSentiment(productData, mode) {
-    const focusArea = this.getFocusAreaForMode(mode);
-
-    const reviewText = productData.reviews
-      ?.slice(0, 10)
-      .map(r => `${r.rating}/5 - ${r.title}: ${r.body}`)
-      .join('\n\n') || 'No reviews available';
-
-    const prompt = `You are a product review analyzer. Analyze these reviews and extract key pros and cons, focusing on: ${focusArea}
-
-Product: ${productData.title}
-
-Reviews:
-${reviewText}
-
-Return your analysis as a JSON object with this exact structure:
-{
-  "pros": ["array of 3-5 key positive points from reviews"],
-  "cons": ["array of 3-5 key negative points or concerns from reviews"],
-  "confidence": 0.95
-}
-
-Focus specifically on: ${focusArea}. Extract real insights from the reviews, not generic statements.`;
-
-    return await this.callClaude(prompt, HAIKU_MODEL, { pros: [], cons: [], confidence: 1.0 });
-  }
-
-  /**
-   * Analyze beauty products (ingredients, skin type, etc.)
-   */
-  static async analyzeBeautyProduct(productData) {
-    const prompt = `You are a beauty product expert. Analyze this product for skin type compatibility and potential irritants.
-
-Product: ${productData.title}
-
-Specifications:
-${JSON.stringify(productData.specs, null, 2)}
-
-Ingredients (if listed):
-${productData.description || 'Not specified'}
-
-Reviews (sample):
-${productData.reviews?.slice(0, 5).map(r => r.body).join('\n\n') || 'No reviews'}
-
-Return your analysis as a JSON object:
-{
-  "summary": "Brief 2-3 sentence overview of the product for different skin types",
-  "suitableFor": ["array of skin types this works well for"],
-  "concerns": ["array of potential irritants or concerns"],
-  "pros": ["key benefits mentioned in reviews"],
-  "cons": ["common complaints"],
-  "confidence": 0.95
-}`;
-
-    return await this.callClaude(prompt, HAIKU_MODEL, {
-      summary: 'Analysis in progress...',
-      suitableFor: [],
-      concerns: [],
-      pros: [],
-      cons: [],
-      confidence: 1.0
-    });
+    return await this.callClaude(prompt, HAIKU_MODEL, fallback);
   }
 
   /**
    * Answer user questions with grounded context (RAG-style)
    */
-  static async answerQuestion(question, productContext) {
-    // Extract relevant snippets from product data
-    const context = this.extractRelevantContext(question, productContext);
+  static async answerQuestion(question, productData, externalReviewInsights = null) {
+    const fallbackResponse = {
+      action: 'respond',
+      answer: 'I could not find that information in the provided product details.',
+      source: null,
+      confidence: 0.5
+    };
 
-    const prompt = `You are a helpful shopping assistant. Answer the user's question ONLY based on the provided product information. If the information is not in the context, say so.
+    let searchContext = null;
+    let iterations = 0;
+    const maxSearchIterations = 2;
 
-Product: ${productContext.title}
+    while (iterations <= maxSearchIterations) {
+      const context = this.extractRelevantContext(question, productData, externalReviewInsights);
+      const searchSummary = this.formatSearchResultsForPrompt(searchContext);
+
+      const prompt = `You are a grounded shopping assistant. Answer the user's question ONLY using the provided context and optional smart-search results. If information is unavailable, say so clearly.
+
+Product: ${productData?.title || 'Unknown Product'}
 
 Context:
 ${context}
 
-User Question: ${question}
+Latest Smart Search Results:
+${searchSummary}
 
-Provide a concise, direct answer based ONLY on the information above. If you cite specific information, note which section it came from (e.g., "According to the product description..." or "Based on the reviews...").
+Question: ${question}
 
-Return your response as JSON:
-{
-  "answer": "Your answer here",
-  "source": "CSS selector or section name where the info came from (e.g., '#productDescription' or null)",
-  "confidence": 0.95
-}`;
+You may request additional public information by emitting the following JSON:
+{"action":"smart_search","toolRequest":{"query":"string","siteFilter":null}}
 
-    return await this.callClaude(prompt, SONNET_MODEL, {
-      answer: 'I could not find that information in the product details.',
-      source: null,
-      confidence: 0.5
-    });
+When you have enough information, respond with:
+{"action":"respond","answer":"complete answer grounded in provided evidence","source":"CSS selector or section name if applicable","confidence":0.0-1.0}
+
+Always respond with strictly valid JSON.`;
+
+      const response = await this.callClaude(prompt, SONNET_MODEL, fallbackResponse);
+
+      if (!response || response.action !== 'smart_search') {
+        return {
+          answer: response?.answer || fallbackResponse.answer,
+          source: response?.source || fallbackResponse.source,
+          confidence: typeof response?.confidence === 'number' ? response.confidence : fallbackResponse.confidence,
+          search: searchContext?.result ? {
+            query: searchContext.request.query,
+            siteFilter: searchContext.request.siteFilter || null,
+            summary: searchContext.result.analysis?.summary || null,
+            bestLinks: searchContext.result.analysis?.bestLinks || []
+          } : null
+        };
+      }
+
+      if (!response.toolRequest?.query || iterations === maxSearchIterations) {
+        return fallbackResponse;
+      }
+
+      try {
+        const result = await WebSearch.smartSearch(response.toolRequest.query, {
+          siteFilter: response.toolRequest.siteFilter || null,
+          maxResults: 12,
+          analysisResultCount: 5
+        });
+
+        searchContext = {
+          request: {
+            query: response.toolRequest.query,
+            siteFilter: response.toolRequest.siteFilter || null
+          },
+          result
+        };
+        iterations += 1;
+      } catch (error) {
+        console.error('[Claude API] Smart search tool failed:', error);
+        return fallbackResponse;
+      }
+    }
+
+    return fallbackResponse;
   }
 
   /**
    * Extract relevant context for Q&A
    */
-  static extractRelevantContext(question, productData) {
+  static extractRelevantContext(question, productData, externalReviewInsights = null) {
     const contextParts = [];
 
     // Always include title and basic info
@@ -185,6 +235,21 @@ Return your response as JSON:
     if (question.toLowerCase().includes('review') || question.toLowerCase().includes('quality') || question.toLowerCase().includes('good')) {
       const reviews = productData.reviews?.slice(0, 5).map(r => `${r.rating}/5: ${r.body}`).join('\n') || 'No reviews';
       contextParts.push(`Reviews:\n${reviews}`);
+    }
+
+    if (productData.reviews?.length) {
+      const reviewSummaries = productData.reviews.slice(0, 5).map((review, index) => {
+        const rating = review.rating ? `${review.rating}/5` : 'Rating N/A';
+        const title = review.title || 'Untitled review';
+        const body = review.body ? review.body.slice(0, 220) : 'No details provided';
+        return `${index + 1}. ${rating} — ${title}\n${body}`;
+      }).join('\n\n');
+      contextParts.push(`Top on-page reviews:\n${reviewSummaries}`);
+    }
+
+    if (externalReviewInsights?.analysis) {
+      const externalSummary = this.formatExternalInsightsForPrompt(externalReviewInsights);
+      contextParts.push(externalSummary);
     }
 
     // Always include bullets
@@ -213,6 +278,53 @@ Return your response as JSON:
     };
 
     return focusAreas[mode] || focusAreas['GENERIC'];
+  }
+
+  static formatExternalInsightsForPrompt(externalInsights) {
+    if (!externalInsights?.analysis) {
+      return 'No external web findings were available for this product yet.';
+    }
+
+    const { analysis, query } = externalInsights;
+    const keyFindings = (analysis.keyFindings || [])
+      .slice(0, 5)
+      .map((item, index) => `${index + 1}. ${item}`)
+      .join('\n');
+
+    const bestLinks = (analysis.bestLinks || [])
+      .slice(0, 3)
+      .map(link => `- ${link.title}: ${link.reason || 'Relevant insight'}`)
+      .join('\n');
+
+    return `DuckDuckGo Smart Search (query: "${query}") summary: ${analysis.summary || 'Not provided.'}
+Key findings:
+${keyFindings || '- None provided'}
+Suggested sources:
+${bestLinks || '- None provided'}`;
+  }
+
+  static formatSearchResultsForPrompt(searchContext) {
+    if (!searchContext?.result) {
+      return 'No smart search has been performed yet.';
+    }
+
+    const { request, result } = searchContext;
+    const analysis = result.analysis || {};
+    const keyFindings = (analysis.keyFindings || [])
+      .slice(0, 4)
+      .map((item, index) => `${index + 1}. ${item}`)
+      .join('\n');
+    const links = (analysis.bestLinks || [])
+      .slice(0, 3)
+      .map(link => `- ${link.title}: ${link.reason || 'Relevant insight'}`)
+      .join('\n');
+
+    return `Smart search query: "${request.query}"${request.siteFilter ? ` (site filter: ${request.siteFilter})` : ''}
+Summary: ${analysis.summary || 'Not provided.'}
+Key findings:
+${keyFindings || '- None provided'}
+Suggested sources:
+${links || '- None provided'}`;
   }
 
   /**

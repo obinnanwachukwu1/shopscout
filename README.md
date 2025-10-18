@@ -64,6 +64,16 @@ Comprehensive documentation is available in `local_docs/`:
 - `PROJECT_STATUS.md` - Development status and roadmap
 - `PROJECT_SUMMARY.txt` - Visual project overview
 
+## Local Search Core (HTML Proxy)
+
+Some shopping sites block extension fetches via CORS. Run the lightweight proxy to relay page HTML through your own machine:
+
+1. Install the browser binaries once: `npx playwright install chromium`
+2. Start the service: `node search-core.js`
+
+The service listens on `http://127.0.0.1:9000`. Keep it running while the extension is active so smart search can resolve HTML through the proxy. Set `SHOPSCOUT_SEARCH_CORE_PORT` to change the port if needed.  
+Set `SHOPSCOUT_SEARCH_CORE_PLAYWRIGHT=false` to fall back to plain fetch, or use `render=fetch` / `render=browser` query params to override per request.
+
 ## License
 
 MIT

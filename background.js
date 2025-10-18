@@ -15,10 +15,164 @@ import { CategoryDetector } from './src/modules/category-detector.js';
 import { BuyScoreCalculator } from './src/modules/buy-score-calculator.js';
 import { PriceComparison } from './src/modules/price-comparison.js';
 import { StopConditionChecker } from './src/modules/stop-condition-checker.js';
+import { WebSearch } from './src/modules/web-search.js';
 
 // Global state
 let currentAnalysis = null;
 let analysisCache = new Map();
+let pendingAnalyses = new Map();
+
+const ANALYSIS_CACHE_TTL = 5 * 60 * 1000;
+const EXTERNAL_REVIEW_TTL = 15 * 60 * 1000;
+
+const externalReviewCache = new Map();
+const externalReviewPending = new Map();
+
+function normalizeSpecAnalysis(raw, defaultConfidence = 0.6) {
+  if (!raw || typeof raw !== 'object') {
+    return {
+      conflicts: [],
+      redFlags: [],
+      hasNewerModel: false,
+      confidence: defaultConfidence
+    };
+  }
+
+  return {
+    conflicts: Array.isArray(raw.conflicts) ? raw.conflicts : [],
+    redFlags: Array.isArray(raw.redFlags) ? raw.redFlags : [],
+    hasNewerModel: Boolean(raw.hasNewerModel),
+    confidence: typeof raw.confidence === 'number' ? raw.confidence : defaultConfidence
+  };
+}
+
+function normalizeSentimentAnalysis(raw, mode, defaultConfidence = 0.6) {
+  const focus = ClaudeAPI.getFocusAreaForMode(mode);
+
+  if (!raw || typeof raw !== 'object') {
+    return {
+      focus,
+      pros: [],
+      cons: [],
+      confidence: defaultConfidence
+    };
+  }
+
+  return {
+    focus: raw.focus || focus,
+    pros: Array.isArray(raw.pros) ? raw.pros : [],
+    cons: Array.isArray(raw.cons) ? raw.cons : [],
+    confidence: typeof raw.confidence === 'number' ? raw.confidence : defaultConfidence
+  };
+}
+
+function normalizeBeautyAnalysis(raw, defaultConfidence = 0.5) {
+  if (!raw || typeof raw !== 'object') {
+    return {
+      summary: 'Analysis unavailable.',
+      suitableFor: [],
+      concerns: [],
+      pros: [],
+      cons: [],
+      confidence: defaultConfidence
+    };
+  }
+
+  return {
+    summary: raw.summary || 'Analysis unavailable.',
+    suitableFor: Array.isArray(raw.suitableFor) ? raw.suitableFor : [],
+    concerns: Array.isArray(raw.concerns) ? raw.concerns : [],
+    pros: Array.isArray(raw.pros) ? raw.pros : [],
+    cons: Array.isArray(raw.cons) ? raw.cons : [],
+    confidence: typeof raw.confidence === 'number' ? raw.confidence : defaultConfidence
+  };
+}
+
+async function fetchExternalReviewIntel(productData) {
+  if (!productData?.title) {
+    return null;
+  }
+
+  const query = `${productData.title} reviews`;
+  const cacheKey = `${productData.site || 'unknown'}::${query.toLowerCase()}`;
+
+  const cached = externalReviewCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < EXTERNAL_REVIEW_TTL) {
+    return cached.data;
+  }
+
+  if (externalReviewPending.has(cacheKey)) {
+    try {
+      return await externalReviewPending.get(cacheKey);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  const fetchPromise = (async () => {
+    try {
+      const searchResult = await WebSearch.smartSearch(query, {
+        maxResults: 12,
+        analysisResultCount: 5,
+        useClaude: true
+      });
+
+      const payload = {
+        query,
+        ...searchResult
+      };
+
+      externalReviewCache.set(cacheKey, {
+        data: payload,
+        timestamp: Date.now()
+      });
+
+      return payload;
+    } catch (error) {
+      console.error('[Background] External review intel failed:', error);
+      return null;
+    } finally {
+      externalReviewPending.delete(cacheKey);
+    }
+  })();
+
+  externalReviewPending.set(cacheKey, fetchPromise);
+  return await fetchPromise;
+}
+
+async function performAnalysis(productData, cacheKey) {
+  // Step 1: Check stop conditions
+  const stopCondition = StopConditionChecker.check(productData);
+  if (stopCondition.shouldStop) {
+    const result = {
+      status: 'stopped',
+      reason: stopCondition.reason,
+      message: stopCondition.message,
+      productData
+    };
+
+    analysisCache.set(cacheKey, {
+      data: result,
+      timestamp: Date.now()
+    });
+
+    return result;
+  }
+
+  // Step 2: Detect category and select mode
+  const category = CategoryDetector.detect(productData);
+  console.log('Detected category:', category);
+
+  // Step 3: Run analysis based on mode
+  const analysisResult = await runAnalysisByMode(productData, category);
+
+  analysisCache.set(cacheKey, {
+    data: analysisResult,
+    timestamp: Date.now()
+  });
+
+  return analysisResult;
+}
 
 // Initialize on install
 chrome.runtime.onInstalled.addListener(() => {
@@ -53,6 +207,7 @@ async function handleMessage(message, sender, sendResponse) {
       case 'CLEAR_CACHE':
         console.log('[Background] Clearing cache and current analysis');
         analysisCache.clear();
+        pendingAnalyses.clear();
         currentAnalysis = null;
         sendResponse({ success: true });
         break;
@@ -80,8 +235,7 @@ async function handleProductDataScraped(productData, sendResponse) {
   const cacheKey = `${productData.site}_${productData.productId}`;
   if (analysisCache.has(cacheKey)) {
     const cached = analysisCache.get(cacheKey);
-    // Cache for 5 minutes
-    if (Date.now() - cached.timestamp < 5 * 60 * 1000) {
+    if (Date.now() - cached.timestamp < ANALYSIS_CACHE_TTL) {
       console.log('Returning cached analysis');
       currentAnalysis = cached.data;
       sendResponse({ success: true, data: cached.data });
@@ -90,37 +244,35 @@ async function handleProductDataScraped(productData, sendResponse) {
     }
   }
 
-  // Step 1: Check stop conditions
-  const stopCondition = StopConditionChecker.check(productData);
-  if (stopCondition.shouldStop) {
-    const result = {
-      status: 'stopped',
-      reason: stopCondition.reason,
-      message: stopCondition.message,
-      productData
-    };
-    currentAnalysis = result;
-    sendResponse({ success: true, data: result });
-    broadcastToSidepanel({ type: 'ANALYSIS_UPDATED', data: result });
-    return;
+  let analysisPromise = pendingAnalyses.get(cacheKey);
+  let isOwner = false;
+
+  if (!analysisPromise) {
+    isOwner = true;
+    analysisPromise = performAnalysis(productData, cacheKey)
+      .catch(error => {
+        // Ensure the error propagates to awaiting callers
+        throw error;
+      });
+    pendingAnalyses.set(cacheKey, analysisPromise);
   }
 
-  // Step 2: Detect category and select mode
-  const category = CategoryDetector.detect(productData);
-  console.log('Detected category:', category);
+  try {
+    const analysisResult = await analysisPromise;
+    currentAnalysis = analysisResult;
+    sendResponse({ success: true, data: analysisResult });
 
-  // Step 3: Run analysis based on mode
-  const analysisResult = await runAnalysisByMode(productData, category);
-
-  // Cache the result
-  analysisCache.set(cacheKey, {
-    data: analysisResult,
-    timestamp: Date.now()
-  });
-
-  currentAnalysis = analysisResult;
-  sendResponse({ success: true, data: analysisResult });
-  broadcastToSidepanel({ type: 'ANALYSIS_UPDATED', data: analysisResult });
+    if (isOwner) {
+      broadcastToSidepanel({ type: 'ANALYSIS_UPDATED', data: analysisResult });
+    }
+  } catch (error) {
+    console.error('Analysis pipeline failed:', error);
+    sendResponse({ success: false, error: error.message });
+  } finally {
+    if (isOwner) {
+      pendingAnalyses.delete(cacheKey);
+    }
+  }
 }
 
 /**
@@ -160,12 +312,17 @@ async function runAnalysisByMode(productData, category) {
 async function runElectronicsMode(result, productData) {
   console.log('Running Electronics Mode');
 
-  // Parallel execution of independent tasks
-  const [priceData, specAnalysis, sentimentAnalysis] = await Promise.all([
+  const [priceData, externalReviews] = await Promise.all([
     PriceComparison.fetchComparables(productData),
-    ClaudeAPI.analyzeSpecs(productData),
-    ClaudeAPI.analyzeSentiment(productData, 'ELECTRONICS')
+    fetchExternalReviewIntel(productData)
   ]);
+
+  const bundle = await ClaudeAPI.analyzeProductBundle(productData, 'ELECTRONICS', {
+    externalInsights: externalReviews
+  });
+
+  const specAnalysis = normalizeSpecAnalysis(bundle?.specAnalysis, bundle?.confidence || 0.6);
+  const sentimentAnalysis = normalizeSentimentAnalysis(bundle?.sentiment, 'ELECTRONICS', bundle?.confidence || 0.6);
 
   // Add current price to priceData
   priceData.currentPrice = productData.price?.value || null;
@@ -183,6 +340,8 @@ async function runElectronicsMode(result, productData) {
     priceData,
     specAnalysis,
     sentimentAnalysis,
+    externalReviews,
+    summary: bundle?.recommendation || null,
     buyScore,
     recommendation: generateRecommendation(buyScore)
   };
@@ -194,10 +353,16 @@ async function runElectronicsMode(result, productData) {
 async function runFashionMode(result, productData) {
   console.log('Running Fashion Mode');
 
-  const [priceData, fitAnalysis] = await Promise.all([
+  const [priceData, externalReviews] = await Promise.all([
     PriceComparison.fetchComparables(productData),
-    ClaudeAPI.analyzeSentiment(productData, 'FASHION')
+    fetchExternalReviewIntel(productData)
   ]);
+
+  const bundle = await ClaudeAPI.analyzeProductBundle(productData, 'FASHION', {
+    externalInsights: externalReviews
+  });
+
+  const fitAnalysis = normalizeSentimentAnalysis(bundle?.sentiment, 'FASHION', bundle?.confidence || 0.6);
 
   // Add current price to priceData
   priceData.currentPrice = productData.price?.value || null;
@@ -206,6 +371,8 @@ async function runFashionMode(result, productData) {
     ...result,
     priceData,
     fitAnalysis,
+    externalReviews,
+    summary: bundle?.recommendation || null,
     buyScore: null, // Disabled for fashion
     verdict: {
       type: 'fit_sizing',
@@ -220,10 +387,16 @@ async function runFashionMode(result, productData) {
 async function runBeautyMode(result, productData) {
   console.log('Running Beauty Mode');
 
-  const [priceData, beautyAnalysis] = await Promise.all([
+  const [priceData, externalReviews] = await Promise.all([
     PriceComparison.fetchComparables(productData),
-    ClaudeAPI.analyzeBeautyProduct(productData)
+    fetchExternalReviewIntel(productData)
   ]);
+
+  const bundle = await ClaudeAPI.analyzeProductBundle(productData, 'BEAUTY', {
+    externalInsights: externalReviews
+  });
+
+  const beautyAnalysis = normalizeBeautyAnalysis(bundle?.beauty, bundle?.confidence || 0.5);
 
   // Add current price to priceData
   priceData.currentPrice = productData.price?.value || null;
@@ -232,6 +405,8 @@ async function runBeautyMode(result, productData) {
     ...result,
     priceData,
     beautyAnalysis,
+    externalReviews,
+    summary: bundle?.recommendation || null,
     buyScore: null, // Disabled for beauty
     verdict: {
       type: 'beauty_analysis',
@@ -246,15 +421,23 @@ async function runBeautyMode(result, productData) {
 async function runCollectiblesMode(result, productData) {
   console.log('Running Collectibles Mode');
 
-  const [soldComps, sentimentAnalysis] = await Promise.all([
+  const [soldComps, externalReviews] = await Promise.all([
     PriceComparison.fetchSoldListings(productData),
-    ClaudeAPI.analyzeSentiment(productData, 'COLLECTIBLES')
+    fetchExternalReviewIntel(productData)
   ]);
+
+  const bundle = await ClaudeAPI.analyzeProductBundle(productData, 'COLLECTIBLES', {
+    externalInsights: externalReviews
+  });
+
+  const sentimentAnalysis = normalizeSentimentAnalysis(bundle?.sentiment, 'COLLECTIBLES', bundle?.confidence || 0.6);
 
   return {
     ...result,
     soldComps,
     sentimentAnalysis,
+    externalReviews,
+    summary: bundle?.recommendation || null,
     buyScore: null, // Disabled for collectibles
     verdict: {
       type: 'sold_comps',
@@ -269,10 +452,17 @@ async function runCollectiblesMode(result, productData) {
 async function runGenericMode(result, productData) {
   console.log('Running Generic Mode');
 
-  const [priceData, sentimentAnalysis] = await Promise.all([
+  const [priceData, externalReviews] = await Promise.all([
     PriceComparison.fetchComparables(productData),
-    ClaudeAPI.analyzeSentiment(productData, 'GENERIC')
+    fetchExternalReviewIntel(productData)
   ]);
+
+  const bundle = await ClaudeAPI.analyzeProductBundle(productData, 'GENERIC_HOME_GOODS', {
+    externalInsights: externalReviews
+  });
+
+  const specAnalysis = normalizeSpecAnalysis(bundle?.specAnalysis, bundle?.confidence || 0.6);
+  const sentimentAnalysis = normalizeSentimentAnalysis(bundle?.sentiment, 'GENERIC', bundle?.confidence || 0.6);
 
   // Add current price to priceData
   priceData.currentPrice = productData.price?.value || null;
@@ -288,6 +478,9 @@ async function runGenericMode(result, productData) {
     ...result,
     priceData,
     sentimentAnalysis,
+    specAnalysis,
+    externalReviews,
+    summary: bundle?.recommendation || null,
     buyScore,
     recommendation: generateRecommendation(buyScore)
   };
@@ -299,8 +492,16 @@ async function runGenericMode(result, productData) {
 async function handleUserQuestion(question, context, sendResponse) {
   console.log('Handling user question:', question);
 
-  // Use Claude to answer with RAG-style context
-  const answer = await ClaudeAPI.answerQuestion(question, context);
+  const productData = context?.productData || context || currentAnalysis?.productData;
+  if (!productData) {
+    sendResponse({ success: false, error: 'No product context available' });
+    return;
+  }
+
+  const externalReviews = context?.externalReviews || currentAnalysis?.externalReviews || null;
+
+  // Use Claude to answer with RAG-style context and optional smart search
+  const answer = await ClaudeAPI.answerQuestion(question, productData, externalReviews);
 
   sendResponse({ success: true, data: answer });
   broadcastToSidepanel({ type: 'QUESTION_ANSWERED', data: answer });
@@ -347,6 +548,7 @@ async function refreshAnalysis(sendResponse) {
   }
 
   analysisCache.clear();
+  pendingAnalyses.clear();
   // Trigger re-scrape from content script
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     if (tabs[0]) {

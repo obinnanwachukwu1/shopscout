@@ -36,10 +36,25 @@ function setupEventListeners() {
 
   // Poll for tab changes every 2 seconds
   let lastTabUrl = null;
+  let hasInitializedTabWatcher = false;
   setInterval(async () => {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (tab && tab.url !== lastTabUrl) {
+        if (!hasInitializedTabWatcher) {
+          // First observation establishes baseline without forcing a refresh
+          hasInitializedTabWatcher = true;
+          lastTabUrl = tab.url;
+
+          const isProductPage = (tab.url.includes('amazon.com/') && tab.url.includes('/dp/')) ||
+                               tab.url.includes('ebay.com/itm/');
+
+          if (!isProductPage) {
+            showEmptyState();
+          }
+          return;
+        }
+
         console.log('[Sidepanel] Tab URL changed:', lastTabUrl, '->', tab.url);
         lastTabUrl = tab.url;
 
@@ -330,22 +345,30 @@ function renderAnalysis(analysis) {
       html.push(renderBuyScore(analysis.buyScore, analysis.recommendation));
       html.push(renderPriceComparison(analysis.priceData));
       html.push(renderSentimentAnalysis(analysis.sentimentAnalysis));
+      html.push(renderReviewHighlights(analysis.productData));
+      html.push(renderExternalReviewIntel(analysis.externalReviews));
       html.push(renderSpecAnalysis(analysis.specAnalysis));
       break;
 
     case 'FASHION':
       html.push(renderPriceComparison(analysis.priceData));
       html.push(renderFitAnalysis(analysis.fitAnalysis));
+      html.push(renderReviewHighlights(analysis.productData));
+      html.push(renderExternalReviewIntel(analysis.externalReviews));
       break;
 
     case 'BEAUTY':
       html.push(renderPriceComparison(analysis.priceData));
       html.push(renderBeautyAnalysis(analysis.beautyAnalysis));
+      html.push(renderReviewHighlights(analysis.productData));
+      html.push(renderExternalReviewIntel(analysis.externalReviews));
       break;
 
     case 'COLLECTIBLES':
       html.push(renderSoldComps(analysis.soldComps));
       html.push(renderSentimentAnalysis(analysis.sentimentAnalysis));
+      html.push(renderReviewHighlights(analysis.productData));
+      html.push(renderExternalReviewIntel(analysis.externalReviews));
       break;
 
     case 'GENERIC_HOME_GOODS':
@@ -353,14 +376,14 @@ function renderAnalysis(analysis) {
       html.push(renderBuyScore(analysis.buyScore, analysis.recommendation));
       html.push(renderPriceComparison(analysis.priceData));
       html.push(renderSentimentAnalysis(analysis.sentimentAnalysis));
+      html.push(renderReviewHighlights(analysis.productData));
+      html.push(renderExternalReviewIntel(analysis.externalReviews));
       break;
   }
 
-  // Q&A section (always shown)
-  html.push(renderQASection());
-
   contentDiv.innerHTML = html.join('');
   attachQAEventListeners();
+  attachReviewHighlightHandlers();
 }
 
 /**
@@ -429,18 +452,64 @@ function renderBuyScore(buyScore, recommendation) {
   if (!buyScore || !recommendation) return '';
 
   const score = buyScore.total || 0;
-  const color = recommendation.color || '#6b7280';
+  const percentage = (score / 10) * 100; // Convert 0-10 score to 0-100%
+
+  // Calculate rotation for the needle (0% = -90deg, 100% = 90deg)
+  const rotation = -90 + (percentage * 1.8);
 
   return `
     <div class="buy-score-card">
-      <div class="score-circle" style="background: ${color};">
-        ${score.toFixed(1)}
-      </div>
-      <div class="score-label" style="color: ${color};">
-        ${recommendation.verdict}
-      </div>
-      <div class="score-message">
-        ${recommendation.message}
+      <div class="speedometer" style="display: flex; flex-direction: column; align-items: center;">
+        <svg viewBox="0 0 200 120" style="width: 100%; max-width: 300px; display: block; margin: 0 auto;">
+          <!-- Gradient definition -->
+          <defs>
+            <linearGradient id="scoreGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" style="stop-color:#ef4444;stop-opacity:1" />
+              <stop offset="50%" style="stop-color:#f59e0b;stop-opacity:1" />
+              <stop offset="100%" style="stop-color:#22c55e;stop-opacity:1" />
+            </linearGradient>
+          </defs>
+
+          <!-- Gray background arc -->
+          <path d="M 30 100 A 70 70 0 0 1 170 100"
+                fill="none"
+                stroke="#e5e7eb"
+                stroke-width="20"
+                stroke-linecap="round"/>
+
+          <!-- Colored arc with gradient -->
+          <path d="M 30 100 A 70 70 0 0 1 170 100"
+                fill="none"
+                stroke="url(#scoreGradient)"
+                stroke-width="20"
+                stroke-linecap="round"
+                stroke-dasharray="${percentage * 2.2}, 220"
+                style="transition: stroke-dasharray 0.5s ease;"/>
+
+          <!-- Needle -->
+          <g transform="translate(100, 100)">
+            <line x1="0" y1="0" x2="0" y2="-60"
+                  stroke="#374151"
+                  stroke-width="3"
+                  stroke-linecap="round"
+                  transform="rotate(${rotation})"
+                  style="transition: transform 0.5s ease;"/>
+            <circle cx="0" cy="0" r="6" fill="#374151"/>
+          </g>
+        </svg>
+
+        <!-- Score value display -->
+        <div style="text-align: center; margin-top: 0px;">
+          <div style="font-size: 36px; font-weight: 700; color: ${recommendation.color};">
+            ${score.toFixed(1)}
+          </div>
+          <div style="font-size: 16px; font-weight: 600; color: ${recommendation.color}; margin-top: 4px;">
+            ${recommendation.verdict}
+          </div>
+          <div style="font-size: 13px; color: #6b7280; margin-top: 8px; line-height: 1.4;">
+            ${recommendation.message}
+          </div>
+        </div>
       </div>
     </div>
   `;
@@ -513,6 +582,80 @@ function renderSentimentAnalysis(sentiment) {
           <ul>
             ${cons.length > 0 ? cons.map(con => `<li>${con}</li>`).join('') : '<li>No cons found</li>'}
           </ul>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderReviewHighlights(product) {
+  if (!product?.reviews?.length) return '';
+
+  const reviewItems = product.reviews.slice(0, 5).map(review => {
+    const rating = typeof review.rating === 'number' ? `${review.rating.toFixed(1)}/5` : 'N/A';
+    const helpful = typeof review.helpfulCount === 'number' ? `${review.helpfulCount} found helpful` : '';
+    const badgeHtml = (review.badges || []).map(badge => `<span class="badge badge-info" style="margin-right: 6px;">${badge}</span>`).join('');
+    const highlightButton = review.selector
+      ? `<button class="link-button review-highlight-btn" data-highlight-selector="${review.selector}">📍 View on page</button>`
+      : '';
+
+    return `
+      <div class="review-highlight" style="border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; margin-bottom: 12px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+          <div style="font-weight: 600; color: #2563eb;">${rating}</div>
+          <div style="font-size: 12px; color: #6b7280;">${review.date || ''}</div>
+        </div>
+        <div style="margin-top: 6px; font-weight: 600;">${review.title || 'Untitled review'}</div>
+        <div style="margin-top: 6px; font-size: 13px; line-height: 1.5;">${review.body || 'No review text available.'}</div>
+        <div style="margin-top: 8px; font-size: 12px; color: #6b7280; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+          ${review.author ? `<span>by ${review.author}</span>` : ''}
+          ${helpful ? `<span>${helpful}</span>` : ''}
+          ${badgeHtml}
+        </div>
+        <div style="margin-top: 8px;">${highlightButton}</div>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="card">
+      <div class="card-title">
+        <span class="card-icon">⭐</span>
+        Top On-Page Reviews
+      </div>
+      <div>${reviewItems}</div>
+    </div>
+  `;
+}
+
+function renderExternalReviewIntel(externalReviews) {
+  if (!externalReviews?.analysis) return '';
+
+  const { analysis, query } = externalReviews;
+  const keyFindings = (analysis.keyFindings || []).slice(0, 5).map(finding => `<li>${finding}</li>`).join('') || '<li>No external findings captured.</li>';
+  const bestLinks = (analysis.bestLinks || []).slice(0, 3).map(link => `
+    <li>
+      <a href="${link.url}" target="_blank" rel="noopener" class="link-button">${link.title}</a>
+      <div style="font-size: 12px; color: #6b7280; margin-top: 2px;">${link.reason || 'Relevant insight'}</div>
+    </li>
+  `).join('') || '<li>No suggested sources yet.</li>';
+
+  return `
+    <div class="card">
+      <div class="card-title">
+        <span class="card-icon">🌐</span>
+        Web Consensus
+      </div>
+      <div style="font-size: 13px; line-height: 1.6;">
+        <div style="margin-bottom: 8px; color: #6b7280;">Search query: <strong>${query}</strong></div>
+        <div style="margin-bottom: 12px;">${analysis.summary || 'No summary available.'}</div>
+        <div>
+          <strong>Key findings</strong>
+          <ul style="margin: 6px 0 12px 20px;">${keyFindings}</ul>
+        </div>
+        <div>
+          <strong>Helpful sources</strong>
+          <ul style="margin: 6px 0 0 20px;">${bestLinks}</ul>
         </div>
       </div>
     </div>
@@ -660,6 +803,17 @@ function attachQAEventListeners() {
   }
 }
 
+function attachReviewHighlightHandlers() {
+  document.querySelectorAll('[data-highlight-selector]').forEach(button => {
+    button.addEventListener('click', () => {
+      const selector = button.getAttribute('data-highlight-selector');
+      if (selector) {
+        highlightSource(selector);
+      }
+    });
+  });
+}
+
 /**
  * Handle question submission
  */
@@ -677,7 +831,7 @@ async function handleQuestionSubmit() {
     const response = await chrome.runtime.sendMessage({
       type: 'USER_QUESTION',
       question,
-      context: currentAnalysis?.productData
+      context: currentAnalysis
     });
 
     if (response.success) {
@@ -706,10 +860,25 @@ function displayAnswer(data) {
     ? `<div class="qa-source" onclick="highlightSource('${data.source}')">📍 View source on page</div>`
     : '';
 
+  const searchHtml = data.search?.summary
+    ? `
+      <div class="qa-search-context">
+        <div style="font-weight: 600; margin-top: 12px;">Web Findings</div>
+        <div style="font-size: 12px; color: #6b7280; margin-top: 4px;">${data.search.summary}</div>
+        ${(data.search.bestLinks || []).slice(0, 3).map(link => `
+          <div style="margin-top: 6px;">
+            <a class="link-button" href="${link.url}" target="_blank" rel="noopener">${link.title}</a>
+          </div>
+        `).join('')}
+      </div>
+    `
+    : '';
+
   qaAnswer.innerHTML = `
     <div class="qa-answer">
       ${data.answer}
       ${sourceHtml}
+      ${searchHtml}
     </div>
   `;
 }

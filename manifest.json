@@ -7,7 +7,8 @@
     "storage",
     "activeTab",
     "sidePanel",
-    "scripting"
+    "scripting",
+    "declarativeNetRequest"
   ],
   "host_permissions": [
     "https://www.amazon.com/*",
@@ -15,8 +16,23 @@
     "https://api.anthropic.com/*",
     "https://html.duckduckgo.com/*",
     "https://duckduckgo.com/*",
-    "https://*.duckduckgo.com/*"
+    "https://*.duckduckgo.com/*",
+    "https://support.apple.com/*",
+    "https://www.simplymac.com/*",
+    "https://www.ifixit.com/*",
+    "https://everymac.com/*",
+    "http://127.0.0.1:9000/*",
+    "http://localhost:9000/*"
   ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "cors-header-rules",
+        "enabled": true,
+        "path": "rules/modify-headers.json"
+      }
+    ]
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"

@@ -1,5 +1,8 @@
 import { ClaudeAPI } from './claude-api.js';
 
+const ANALYSIS_HTML_MAX_LENGTH = 8000;
+const LOCAL_SEARCH_PROXY_URL = 'http://127.0.0.1:9000/fetch?render=browser&url=';
+
 /**
  * Web Search Module
  *
@@ -70,7 +73,8 @@ export class WebSearch {
     const {
       maxResults = 10,
       siteFilter = null,
-      analysisResultCount = 5
+      analysisResultCount = 5,
+      useClaude = true
     } = options;
 
     const searchResponse = await this.searchDuckDuckGo(query, { maxResults, siteFilter });
@@ -91,8 +95,18 @@ export class WebSearch {
       };
     }
 
-    const prompt = this.buildAnalysisPrompt(query, analyzedResults);
+    await this.populateAnalysisHtml(analyzedResults, analysisResultCount);
+
     const fallbackAnalysis = this.buildFallbackAnalysis(analyzedResults);
+    const prompt = this.buildAnalysisPrompt(query, analyzedResults);
+
+    if (!useClaude) {
+      return {
+        ...searchResponse,
+        analysis: this.normalizeSmartAnalysis(fallbackAnalysis, analyzedResults),
+        analyzedResults
+      };
+    }
 
     const haikuAnalysis = await ClaudeAPI.callClaude(
       prompt,
@@ -101,6 +115,19 @@ export class WebSearch {
     );
 
     const analysis = this.normalizeSmartAnalysis(haikuAnalysis, analyzedResults);
+    this.applyAnalysisSnippets(analyzedResults, analysis);
+    await this.fillSnippetsFromPages(analyzedResults);
+
+    console.log('[WebSearch] Smart search output:', {
+      query,
+      analysis,
+      analyzedResults: analyzedResults.map(result => ({
+        title: result.title,
+        url: result.url,
+        snippetPreview: result.snippet ? `${result.snippet.slice(0, 200)}${result.snippet.length > 200 ? '…' : ''}` : null,
+        snippetLength: result.snippet ? result.snippet.length : 0
+      }))
+    });
 
     return {
       ...searchResponse,
@@ -116,27 +143,59 @@ export class WebSearch {
     const results = [];
 
     try {
-      // Pattern 1: Extract result blocks with class="result"
-      const resultBlockPattern = /<div class="result[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/g;
-      let match;
+      if (typeof DOMParser !== 'undefined') {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        const nodeList = doc.querySelectorAll('.result');
 
-      while ((match = resultBlockPattern.exec(html)) !== null && results.length < maxResults) {
-        const block = match[1];
+        nodeList.forEach(node => {
+          if (results.length >= maxResults) {
+            return;
+          }
 
-        // Extract title from result__a
-        const titleMatch = block.match(/class="result__a"[^>]*>([^<]+)</);
-        const title = titleMatch ? this.cleanText(titleMatch[1]) : null;
+          const titleAnchor = node.querySelector('a.result__a');
+          if (!titleAnchor || !titleAnchor.textContent) {
+            return;
+          }
 
-        // Extract URL from result__url
-        const urlMatch = block.match(/class="result__url"[^>]*href="([^"]+)"/);
-        const url = urlMatch ? this.decodeUrl(urlMatch[1]) : null;
+          const snippetNode = node.querySelector('.result__snippet');
+          const urlNode = node.querySelector('.result__url');
 
-        // Extract snippet from result__snippet
-        const snippetMatch = block.match(/class="result__snippet"[^>]*>([^<]+)</);
-        const snippet = snippetMatch ? this.cleanText(snippetMatch[1]) : null;
+          const rawUrl = titleAnchor.getAttribute('href') || urlNode?.getAttribute('href');
+          const decodedUrl = rawUrl ? this.decodeUrl(rawUrl) : null;
 
-        if (title && url) {
-          results.push({ title, url, snippet });
+          if (!decodedUrl) {
+            return;
+          }
+
+          results.push({
+            title: this.cleanText(titleAnchor.textContent),
+            url: decodedUrl,
+            snippet: snippetNode ? this.cleanText(snippetNode.textContent) : null
+          });
+        });
+      }
+
+      // Pattern 1: Extract result blocks with class="result" (legacy fallback)
+      if (results.length === 0) {
+        const resultBlockPattern = /<div class="result[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/g;
+        let match;
+
+        while ((match = resultBlockPattern.exec(html)) !== null && results.length < maxResults) {
+          const block = match[1];
+
+          const titleMatch = block.match(/class="result__a"[^>]*>([^<]+)</);
+          const title = titleMatch ? this.cleanText(titleMatch[1]) : null;
+
+          const urlMatch = block.match(/class="result__url"[^>]*href="([^"]+)"/);
+          const url = urlMatch ? this.decodeUrl(urlMatch[1]) : null;
+
+        const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
+        const snippet = snippetMatch ? this.cleanText(this.stripHtml(snippetMatch[1])) : null;
+
+          if (title && url) {
+            results.push({ title, url, snippet });
+          }
         }
       }
 
@@ -212,30 +271,49 @@ export class WebSearch {
       .trim();
   }
 
+  static stripHtml(html) {
+    if (!html) return '';
+    let stripped = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+      .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
+      .replace(/<!--([\s\S]*?)-->/g, ' ');
+
+    stripped = stripped.replace(/<[^>]+>/g, ' ');
+    return stripped;
+  }
+
   /**
    * Build Claude prompt for analyzing search results
    */
   static buildAnalysisPrompt(query, results) {
     const formattedResults = results
       .map((result, index) => {
+        const html = typeof result.analysisHtml === 'string'
+          ? result.analysisHtml.trim()
+          : '';
         const snippet = result.snippet
           ? result.snippet.replace(/\s+/g, ' ').trim()
           : 'No snippet provided.';
+        const label = html ? `Page HTML (truncated to ${html.length} characters)` : 'Snippet';
+        const content = html || snippet;
 
-        return `${index + 1}. Title: ${result.title}\n   URL: ${result.url}\n   Snippet: ${snippet}`;
+        return `${index + 1}. Title: ${result.title}\n   URL: ${result.url}\n   ${label}:\n"""${content}"""`;
       })
       .join('\n\n');
 
-    return `You are a fast research assistant helping a shopping extension understand public information.\n` +
-      `Using only the DuckDuckGo search snippets below, extract the most relevant facts about the query.\n` +
-      `If you cannot find concrete information, acknowledge the gap.\n\n` +
+    return `You are a fast research assistant helping a shopping extension answer the user's research query.\n` +
+      `Identify the primary intent of the query (e.g., price, availability, color options, specs, reviews, authenticity) and surface the most relevant facts for that intent.\n` +
+      `Many results include truncated raw HTML from the page; leverage the structure and content to extract concrete facts (numbers, named colors, specific features, pros/cons, release dates, etc.). When HTML is not available, rely on the snippet, title, and domain reputation to infer useful context instead of claiming there is no data.\n` +
+      `Only state that information is missing when none of the results provide a credible signal after reasonable inference.\n\n` +
       `Search Query: ${query}\n\n` +
       `DuckDuckGo Results:\n${formattedResults}\n\n` +
       `Reply strictly as JSON with this exact schema:\n` +
       `{\n` +
-      `  "summary": "2-3 sentence factual overview directly addressing the query when possible",\n` +
-      `  "keyFindings": ["short bullet findings grounded in the snippets"],\n` +
-      `  "bestLinks": [{"title": "Result title", "url": "https://example.com", "reason": "Why this link helps"}],\n` +
+      `  "summary": "2-3 sentence factual overview that directly answers the query, highlighting the most relevant concrete details (prices, colors, specs, dates, etc.)",\n` +
+      `  "keyFindings": ["succinct bullet findings grounded in the snippets with the most pertinent facts for this query"],\n` +
+      `  "bestLinks": [{"title": "Result title", "url": "https://example.com", "reason": "Specific evidence from this link that helps answer the query"}],\n` +
       `  "missingInfo": "What the snippets do not cover or what needs further research",\n` +
       `  "confidence": 0.0\n` +
       `}\n` +
@@ -356,5 +434,199 @@ export class WebSearch {
     console.log('[WebSearch] No results found, may need to adjust parsing patterns');
 
     return results;
+  }
+
+  static async populateAnalysisHtml(results, maxFetches = 5, maxChars = ANALYSIS_HTML_MAX_LENGTH) {
+    if (!Array.isArray(results) || !results.length || maxFetches <= 0) {
+      return;
+    }
+
+    const tasks = [];
+
+    for (const result of results) {
+      if (!result || result.analysisHtml || !result.url || !/^https?:/i.test(result.url)) {
+        continue;
+      }
+      if (tasks.length >= maxFetches) {
+        break;
+      }
+
+      tasks.push(
+        this.fetchPageHtml(result.url, maxChars)
+          .then(html => {
+            if (!html) {
+              return;
+            }
+            result.analysisHtml = html;
+            if (!result.snippet) {
+              const plainText = this.cleanText(this.stripHtml(html));
+              if (plainText) {
+                result.snippet = plainText.slice(0, 500);
+              }
+            }
+          })
+          .catch(error => {
+            console.warn('[WebSearch] Page HTML fetch failed:', result.url, error);
+          })
+      );
+    }
+
+    if (tasks.length > 0) {
+      await Promise.allSettled(tasks);
+    }
+  }
+
+  static applyAnalysisSnippets(results, analysis) {
+    if (!Array.isArray(results) || !results.length || !analysis) {
+      return;
+    }
+
+    const normalize = (value) => {
+      if (!value || typeof value !== 'string') return null;
+      try {
+        const url = new URL(value);
+        url.hash = '';
+        return url.toString();
+      } catch {
+        return value.trim().toLowerCase();
+      }
+    };
+
+    const linkReasonByUrl = new Map();
+    const linkReasonByTitle = new Map();
+
+    if (Array.isArray(analysis.bestLinks)) {
+      analysis.bestLinks.forEach(link => {
+        const reason = typeof link?.reason === 'string' ? link.reason.trim() : null;
+        if (!reason) return;
+        const urlKey = normalize(link.url);
+        if (urlKey && !linkReasonByUrl.has(urlKey)) {
+          linkReasonByUrl.set(urlKey, reason);
+        }
+        const titleKey = typeof link.title === 'string' ? link.title.trim().toLowerCase() : null;
+        if (titleKey && !linkReasonByTitle.has(titleKey)) {
+          linkReasonByTitle.set(titleKey, reason);
+        }
+      });
+    }
+
+    const fallbackFindings = Array.isArray(analysis.keyFindings)
+      ? analysis.keyFindings.filter(item => typeof item === 'string' && item.trim().length)
+      : [];
+
+    let findingIndex = 0;
+
+    results.forEach(result => {
+      if (!result || (result.snippet && result.snippet.trim().length)) {
+        return;
+      }
+
+      const urlKey = normalize(result.url);
+      const titleKey = typeof result.title === 'string' ? result.title.trim().toLowerCase() : null;
+
+      const reason =
+        (urlKey && linkReasonByUrl.get(urlKey)) ||
+        (titleKey && linkReasonByTitle.get(titleKey)) ||
+        (findingIndex < fallbackFindings.length ? fallbackFindings[findingIndex++] : null);
+
+      if (reason) {
+        result.snippet = reason;
+      }
+    });
+  }
+
+  static async fillSnippetsFromPages(results, maxFetches = 5) {
+    if (!Array.isArray(results) || maxFetches <= 0) {
+      return;
+    }
+
+    const tasks = [];
+    for (const result of results) {
+      if (!result || result.snippet) {
+        continue;
+      }
+      if (!result.url || !/^https?:/i.test(result.url)) {
+        continue;
+      }
+      if (tasks.length >= maxFetches) {
+        break;
+      }
+
+      tasks.push(
+        this.fetchPageSnippet(result.url)
+          .then(snippet => {
+            if (snippet) {
+              result.snippet = snippet;
+            }
+          })
+          .catch(error => {
+            console.warn('[WebSearch] Page snippet fetch failed:', result.url, error);
+          })
+      );
+    }
+
+    if (tasks.length > 0) {
+      await Promise.allSettled(tasks);
+    }
+  }
+
+  static async fetchPageHtml(url, maxChars = ANALYSIS_HTML_MAX_LENGTH) {
+    const sources = [];
+
+    if (LOCAL_SEARCH_PROXY_URL) {
+      sources.push({
+        type: 'proxy',
+        url: `${LOCAL_SEARCH_PROXY_URL}${encodeURIComponent(url)}`,
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml'
+        }
+      });
+    }
+
+    sources.push({
+      type: 'direct',
+      url,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9'
+      }
+    });
+
+    for (const source of sources) {
+      try {
+        const response = await fetch(source.url, {
+          headers: source.headers
+        });
+
+        if (!response.ok) {
+          console.warn(`[WebSearch] ${source.type} fetch non-OK response:`, source.url, response.status);
+          continue;
+        }
+
+        const html = await response.text();
+        if (!html) {
+          continue;
+        }
+
+        return html.length > maxChars ? html.slice(0, maxChars) : html;
+      } catch (error) {
+        console.warn(`[WebSearch] ${source.type} fetch error:`, source.url, error);
+      }
+    }
+
+    return null;
+  }
+
+  static async fetchPageSnippet(url) {
+    try {
+      const html = await this.fetchPageHtml(url);
+      const plainText = this.cleanText(this.stripHtml(html));
+      if (plainText) {
+        return plainText.slice(0, 12000);
+      }
+    } catch (error) {
+      console.warn('[WebSearch] Page snippet fetch error:', url, error);
+    }
+    return null;
   }
 }

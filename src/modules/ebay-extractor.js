@@ -206,6 +206,69 @@ const buildPrice = (labelMap) => {
   });
 };
 
+const extractReviewHelpfulCount = (text) => {
+  const cleaned = clean(text);
+  if (!cleaned) return null;
+  if (/One person/i.test(cleaned)) {
+    return 1;
+  }
+  const match = cleaned.match(/([\d,]+)/);
+  if (!match) return null;
+  const value = parseInt(match[1].replace(/,/g, ''), 10);
+  return Number.isFinite(value) ? value : null;
+};
+
+const extractReviews = () => {
+  const reviews = [];
+  const selectors = [
+    '[data-testid="REVIEW_CARD"]',
+    '[data-testid="ux-review-card"]',
+    '[itemprop="review"]',
+    '.product-review-card',
+    '.reviews__list-item'
+  ];
+
+  const seen = new Set();
+
+  selectors.forEach((selector) => {
+    document.querySelectorAll(selector).forEach((node) => {
+      if (seen.has(node)) return;
+      seen.add(node);
+
+      const title = clean(node.querySelector('[data-testid="review-card-title"], .review-card__title, [itemprop="name"]')?.textContent);
+      const body = clean(node.querySelector('[data-testid="review-card-text"], .review-card__content, [itemprop="description"]')?.textContent);
+      const ratingText =
+        clean(node.querySelector('[data-testid="review-card-rating"], [itemprop="ratingValue"]')?.textContent) ||
+        node.querySelector('[itemprop="reviewRating"] [itemprop="ratingValue"]')?.getAttribute('content');
+      const date =
+        clean(node.querySelector('[data-testid="review-card-date"], time[itemprop="datePublished"]')?.textContent) ||
+        node.querySelector('time[itemprop="datePublished"]')?.getAttribute('datetime');
+      const author =
+        clean(node.querySelector('[data-testid="review-card-author"], [itemprop="author"]')?.textContent) ||
+        clean(node.querySelector('[itemprop="author"] [itemprop="name"]')?.textContent);
+      const helpfulText = clean(node.querySelector('[data-testid="helpful-count"], .review-card__helpful-count')?.textContent);
+
+      if (!title && !body) {
+        return;
+      }
+
+      const id = node.getAttribute('id') || null;
+      reviews.push({
+        id,
+        selector: id ? `#${id}` : null,
+        title,
+        body,
+        rating: ratingText ? parseFloat((ratingText.match(/[\d.]+/) || [])[0]) || null : null,
+        date,
+        author,
+        helpfulCount: extractReviewHelpfulCount(helpfulText || '')
+      });
+    });
+  });
+
+  return reviews.slice(0, 6);
+};
+
 const extractMainImage = () => {
   // Try main product image
   const mainImage = document.querySelector('.ux-image-carousel-item.active img, .ux-image-carousel-item.image img');
@@ -296,6 +359,7 @@ window.extractEbayProduct = () => {
       itemSpecifics: specifics,
       categories,
       description,
+      reviews: extractReviews(),
       mainImage,
       scrapedAt: Date.now()
     };
