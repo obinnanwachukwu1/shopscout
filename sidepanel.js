@@ -13,6 +13,35 @@ const openChatBtn = document.getElementById('openChatBtn');
 
 const REFRESH_ICON_HTML = '<span aria-hidden="true">⟳</span>';
 const REFRESH_LOADING_HTML = '<span aria-hidden="true">…</span>';
+const CONNECTION_ERROR_SNIPPET = 'Could not establish connection';
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function safeRuntimeSendMessage(message, { retries = 2, delayMs = 200 } = {}) {
+  let attempt = 0;
+
+  while (attempt <= retries) {
+    try {
+      return await chrome.runtime.sendMessage(message);
+    } catch (error) {
+      const messageText = (error && error.message) || '';
+      const isConnectionError = messageText.includes(CONNECTION_ERROR_SNIPPET);
+      if (!isConnectionError || attempt === retries) {
+        throw error;
+      }
+
+      console.warn(
+        `[Sidepanel] Runtime message retry ${attempt + 1} for ${message?.type || 'unknown type'}`
+      );
+      await sleep(delayMs * (attempt + 1));
+      attempt += 1;
+    }
+  }
+
+  return null;
+}
 
 function setContent(html, { preserveScroll = true } = {}) {
   const scrollY = preserveScroll ? window.scrollY : 0;
@@ -89,7 +118,7 @@ function setupEventListeners() {
           showLoading();
 
           // Request the background to clear its cache for this product
-          await chrome.runtime.sendMessage({ type: 'CLEAR_CACHE' });
+          await safeRuntimeSendMessage({ type: 'CLEAR_CACHE' });
 
           // Wait a moment then trigger scraping
           setTimeout(() => {
@@ -120,7 +149,7 @@ async function loadCurrentAnalysis() {
   showLoading();
 
   try {
-    const response = await chrome.runtime.sendMessage({
+    const response = await safeRuntimeSendMessage({
       type: 'GET_CURRENT_ANALYSIS'
     });
 
@@ -231,7 +260,18 @@ function pollForAnalysis() {
   const pollInterval = setInterval(async () => {
     attempts++;
 
-    const response = await chrome.runtime.sendMessage({ type: 'GET_CURRENT_ANALYSIS' });
+    let response;
+    try {
+      response = await safeRuntimeSendMessage({ type: 'GET_CURRENT_ANALYSIS' });
+    } catch (error) {
+      console.warn('[Sidepanel] Poll attempt failed:', error);
+      if (attempts >= maxAttempts) {
+        clearInterval(pollInterval);
+        console.log('[Sidepanel] No analysis after', maxAttempts, 'attempts');
+        showEmptyState();
+      }
+      return;
+    }
 
     if (response.success && response.data) {
       clearInterval(pollInterval);
@@ -254,7 +294,7 @@ async function handleRefresh() {
   refreshBtn.innerHTML = REFRESH_LOADING_HTML;
 
   try {
-    await chrome.runtime.sendMessage({ type: 'REFRESH_ANALYSIS' });
+    await safeRuntimeSendMessage({ type: 'REFRESH_ANALYSIS' });
     showLoading();
   } catch (error) {
     console.error('Error refreshing:', error);
@@ -580,6 +620,14 @@ function renderPriceComparison(priceData) {
     const priceLabel = typeof priceValue === 'number'
       ? `$${priceValue.toFixed(2)}`
       : (comp.priceFormatted || comp.formattedPrice || comp.price || 'N/A');
+    const listingFormat = comp.listingFormat || comp.format || comp.listingType || null;
+    const bidCount =
+      typeof comp.bidCount === 'number'
+        ? comp.bidCount
+        : typeof comp.bids === 'number'
+          ? comp.bids
+          : null;
+    const timeLeft = comp.timeLeft || comp.endsIn || comp.expiresIn || null;
 
     return {
       title: comp.title || comp.name || comp.label || `Listing ${index + 1}`,
@@ -589,7 +637,10 @@ function renderPriceComparison(priceData) {
       source: comp.source || comp.marketplace || comp.site || '',
       url: comp.url || comp.link || '',
       description: comp.description || '',
-      type: 'listing'
+      type: 'listing',
+      listingFormat: listingFormat || (comp.isAuction ? 'auction' : null),
+      bidCount: typeof bidCount === 'number' ? bidCount : null,
+      timeLeft: typeof timeLeft === 'string' ? timeLeft : null
     };
   }).filter(item => item.title || item.priceLabel);
 
@@ -1539,7 +1590,7 @@ async function handleQuestionSubmit() {
   qaBtn.textContent = 'Thinking...';
 
   try {
-    const response = await chrome.runtime.sendMessage({
+    const response = await safeRuntimeSendMessage({
       type: 'USER_QUESTION',
       question,
       context: currentAnalysis

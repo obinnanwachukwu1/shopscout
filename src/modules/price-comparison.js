@@ -147,22 +147,49 @@ export class PriceComparison {
       console.log('[eBay Search] Extracted prices:', prices);
       console.log('[eBay Search] Listing comparables:', listingComparables.length);
 
-      const combinedPrices = [...prices, ...listingPrices];
-      const filteredPrices = [...new Set(combinedPrices.filter(value => value > 0 && value < 100000))];
-      if (filteredPrices.length === 0) {
-        console.log('[eBay Search] No prices from direct search, falling back to DuckDuckGo');
+      const isValidPrice = (value) => typeof value === 'number' && value > 0 && value < 100000;
+      const auctionComparables = listingComparables.filter(item => item?.listingFormat === 'auction');
+      const buyNowComparables = listingComparables.filter(
+        item => item?.listingFormat && item.listingFormat !== 'auction'
+      );
+      const unknownComparables = listingComparables.filter(item => !item?.listingFormat);
+
+      const buyNowPrices = buyNowComparables.map(item => item.priceValue).filter(isValidPrice);
+      const comparablePrices = listingComparables.map(item => item.priceValue).filter(isValidPrice);
+
+      const prioritizedPriceList = [];
+      prioritizedPriceList.push(...buyNowPrices);
+      if (prioritizedPriceList.length < 3) {
+        prioritizedPriceList.push(...comparablePrices);
+      }
+      if (prioritizedPriceList.length < 3) {
+        prioritizedPriceList.push(...prices.filter(isValidPrice));
+      }
+
+      const effectivePrices = [...new Set(prioritizedPriceList.filter(isValidPrice))];
+      if (effectivePrices.length === 0) {
+        console.log('[eBay Search] No usable prices after filtering, falling back to DuckDuckGo');
         return await this.searchEbayViaDuckDuckGo(query);
       }
-      const range = this.calculateIqrRange(filteredPrices);
+
+      const range = this.calculateIqrRange(effectivePrices);
+      const pricesForStats = range.filtered.length ? range.filtered : effectivePrices;
+      const usedAuctionPrices = buyNowPrices.length < 3 && auctionComparables.length > 0;
       return {
-        prices: filteredPrices,
-        median: this.calculateMedian(filteredPrices),
+        prices: pricesForStats,
+        median: this.calculateMedian(pricesForStats),
         min: range.min,
         max: range.max,
-        compCount: listingComparables.length || filteredPrices.length,
+        compCount: listingComparables.length || pricesForStats.length,
         currentPrice: null,
         source: 'ebay',
-        comparables: listingComparables
+        comparables: listingComparables,
+        formatBreakdown: {
+          buyItNow: buyNowComparables.length,
+          auction: auctionComparables.length,
+          unknown: unknownComparables.length
+        },
+        usedAuctionPrices
       };
     } catch (error) {
       console.error('[eBay Search] Error:', error);
@@ -199,7 +226,13 @@ export class PriceComparison {
         compCount: comparables.length,
         currentPrice: null,
         source: 'ebay',
-        comparables
+        comparables,
+        formatBreakdown: {
+          buyItNow: 0,
+          auction: 0,
+          unknown: comparables.length
+        },
+        usedAuctionPrices: false
       };
     } catch (error) {
       console.error('[eBay DDG Fallback] Error:', error);
@@ -383,13 +416,29 @@ export class PriceComparison {
     return results;
   }
 
-  static buildComparableEntry({ url, priceValue, site, source, title, condition, description }) {
+  static buildComparableEntry({
+    url,
+    priceValue,
+    site,
+    source,
+    title,
+    condition,
+    description,
+    listingFormat,
+    bidCount,
+    timeLeft
+  }) {
     if (!url || typeof priceValue !== 'number' || !isFinite(priceValue)) {
       return null;
     }
 
     const hostname = this.getHostname(url) || site || 'marketplace';
     const resolvedTitle = title?.trim() || this.deriveComparableTitle(url, hostname);
+    const normalizedListingFormat = listingFormat || null;
+    const normalizedBidCount =
+      typeof bidCount === 'number' && Number.isFinite(bidCount) ? Math.max(0, Math.round(bidCount)) : null;
+    const normalizedTimeLeft =
+      typeof timeLeft === 'string' && timeLeft.trim().length ? timeLeft.trim() : null;
 
     return {
       title: resolvedTitle,
@@ -400,7 +449,11 @@ export class PriceComparison {
       source: hostname,
       description: description || '',
       type: 'listing',
-      origin: source || 'listing'
+      origin: source || 'listing',
+      listingFormat: normalizedListingFormat,
+      bidCount: normalizedBidCount,
+      timeLeft: normalizedTimeLeft,
+      isAuction: normalizedListingFormat === 'auction'
     };
   }
 
@@ -581,9 +634,47 @@ export class PriceComparison {
           const priceEl = node.querySelector('.s-item__price');
           const titleEl = node.querySelector('.s-item__title');
           const conditionEl = node.querySelector('.SECONDARY_INFO');
+          const detailNodes = node.querySelectorAll(
+            '.s-item__detail--primary, .s-item__detail--secondary, .s-item__subtitle, .s-item__time-left'
+          );
+          const detailTexts = Array.from(detailNodes)
+            .map(el => el.textContent)
+            .filter(Boolean)
+            .map(text => text.replace(/\s+/g, ' ').trim());
+          const combinedDetailText = detailTexts.join(' | ');
+          const detailLower = combinedDetailText.toLowerCase();
 
           const url = linkEl?.href;
           const priceValue = this.extractPriceFromText(priceEl?.textContent || '');
+          const priceText = priceEl?.textContent || '';
+
+          let listingFormat = null;
+          if (/\b(?:\d+\s+)?bid/i.test(detailLower) || /auction/i.test(detailLower) || /bids?/i.test(priceText)) {
+            listingFormat = 'auction';
+          } else if (/buy it now/i.test(detailLower)) {
+            listingFormat = 'buy_it_now';
+          } else if (/best offer/i.test(detailLower)) {
+            listingFormat = 'best_offer';
+          }
+
+          if (!listingFormat && /best offer/i.test(priceText)) {
+            listingFormat = 'best_offer';
+          }
+
+          const bidMatch = combinedDetailText.match(/(\d+)\s+bids?/i) || priceText.match(/(\d+)\s+bids?/i);
+          const bidCount = bidMatch ? parseInt(bidMatch[1], 10) : null;
+
+          if (listingFormat !== 'auction' && typeof bidCount === 'number') {
+            listingFormat = 'auction';
+          }
+
+          let timeLeft =
+            detailTexts.find(text => /time left/i.test(text) || /ends in/i.test(text)) ||
+            node.querySelector('.s-item__time-left')?.textContent ||
+            null;
+          if (timeLeft) {
+            timeLeft = timeLeft.replace(/time left\s*/i, '').replace(/ends in\s*/i, '').trim();
+          }
 
           if (url && priceValue) {
             const entry = this.buildComparableEntry({
@@ -592,7 +683,10 @@ export class PriceComparison {
               site: 'ebay',
               source: 'search-result',
               title: titleEl?.textContent?.trim(),
-              condition: conditionEl?.textContent?.trim()
+              condition: conditionEl?.textContent?.trim(),
+              listingFormat,
+              bidCount,
+              timeLeft
             });
 
             if (entry) {
@@ -821,7 +915,13 @@ export class PriceComparison {
       compCount: 0,
       currentPrice: null,
       source: null,
-      comparables: []
+      comparables: [],
+      formatBreakdown: {
+        buyItNow: 0,
+        auction: 0,
+        unknown: 0
+      },
+      usedAuctionPrices: false
     };
   }
 }
