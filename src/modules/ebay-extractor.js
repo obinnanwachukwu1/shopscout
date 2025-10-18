@@ -48,6 +48,25 @@ const parsePrice = (text) => {
   };
 };
 
+const parseCountText = (value) => {
+  if (!value) return null;
+  const normalized = value.toString().trim().toLowerCase();
+  const match = normalized.match(/([\d.,]+)\s*([km]?)/i);
+  if (!match) return parseNumber(value);
+
+  let amount = parseFloat(match[1].replace(/,/g, ''));
+  if (!Number.isFinite(amount)) return null;
+
+  const suffix = match[2];
+  if (suffix === 'k') {
+    amount *= 1_000;
+  } else if (suffix === 'm') {
+    amount *= 1_000_000;
+  }
+
+  return Math.round(amount);
+};
+
 const compactObject = (obj) => {
   const output = { ...obj };
   Object.entries(output).forEach(([key, value]) => {
@@ -95,18 +114,42 @@ const extractSeller = () => {
   const feedbackElements = card.querySelectorAll('[data-testid="x-sellercard-atf__about-seller"] span.ux-textspans');
   let feedbackCount = null;
   feedbackElements.forEach((el) => {
-    if (/\(\d/.test(el.textContent)) {
-      feedbackCount = parseNumber(el.textContent);
+    const text = clean(el.textContent);
+    if (!text) return;
+    const parsed = parseCountText(text);
+    if (parsed != null) {
+      feedbackCount = parsed;
     }
   });
 
-  const ratingText = clean(card.querySelector('[data-testid="x-sellercard-atf__data-item"] span.ux-textspans')?.textContent);
+  const highlightsText = clean(card.querySelector('.x-store-information__highlights')?.textContent);
+  if (feedbackCount == null && highlightsText) {
+    const match = highlightsText.match(/([\d.,]+\s*[kKmM]?)(?=\s*(?:item|feedback|sold))/);
+    if (match) {
+      const parsed = parseCountText(match[1]);
+      if (parsed != null) {
+        feedbackCount = parsed;
+      }
+    }
+  }
+
+  let ratingText = clean(card.querySelector('[data-testid="x-sellercard-atf__data-item"] span.ux-textspans')?.textContent);
+  if (!ratingText && highlightsText) {
+    const match = highlightsText.match(/([\d.,]+%\s*(?:positive)?)/i);
+    if (match) {
+      ratingText = match[1];
+    }
+  }
+
   const ratingPercent = ratingText ? parseNumber(ratingText) : null;
+  const ratingDisplay = ratingPercent != null ? `${ratingPercent}%` : ratingText;
   const storeUrl = card.querySelector('a')?.getAttribute('href') || null;
 
   return compactObject({
     name,
     feedbackCount,
+    rating: ratingDisplay,
+    ratingPercent,
     positivePercent: ratingPercent,
     ratingText,
     storeUrl,

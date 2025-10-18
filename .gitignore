@@ -8,3 +8,5 @@ chrome-extension-key.pem
 config.local.js
 local_docs/
 scrape/
+.claude/
+_metadata/

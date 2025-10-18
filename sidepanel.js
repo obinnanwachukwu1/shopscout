@@ -14,6 +14,9 @@ const openChatBtn = document.getElementById('openChatBtn');
 const REFRESH_ICON_HTML = '<span aria-hidden="true">⟳</span>';
 const REFRESH_LOADING_HTML = '<span aria-hidden="true">…</span>';
 const CONNECTION_ERROR_SNIPPET = 'Could not establish connection';
+const SHOPSCOUT_ICON_SRC_48 = (typeof chrome !== 'undefined' && chrome.runtime?.getURL)
+  ? chrome.runtime.getURL('icons/icon48.png')
+  : 'icons/icon48.png';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -81,6 +84,10 @@ function setupEventListeners() {
       render();
     } else if (message.type === 'QUESTION_ANSWERED') {
       displayAnswer(message.data);
+    } else if (message.type === 'ANALYSIS_RESET') {
+      console.log('[Sidepanel] Analysis reset:', message.data);
+      currentAnalysis = null;
+      showLoading();
     }
   });
 
@@ -255,7 +262,7 @@ async function triggerScrapeOnCurrentTab() {
  */
 function pollForAnalysis() {
   let attempts = 0;
-  const maxAttempts = 10; // Poll for up to 10 seconds
+  const maxAttempts = 30; // Poll for up to 30 seconds (increased from 10)
 
   const pollInterval = setInterval(async () => {
     attempts++;
@@ -369,7 +376,9 @@ function showError(message) {
 function showEmptyState() {
   setContent(`
     <div class="empty-state">
-      <div class="empty-icon">📦</div>
+      <div class="empty-icon">
+        <img src="${SHOPSCOUT_ICON_SRC_48}" alt="">
+      </div>
       <div class="empty-title">No Product Detected</div>
       <div class="empty-message">
         Navigate to an Amazon or eBay product page to see analysis.
@@ -455,6 +464,7 @@ function renderAnalysis(analysis) {
   attachReviewHighlightHandlers();
   attachDealSenseEventListeners();
   attachComparablesEventListeners();
+  attachBuyScoreInfoHandlers();
 }
 
 /**
@@ -514,6 +524,97 @@ function renderProductInfo(product) {
   `;
 }
 
+const BUY_SCORE_FACTOR_DETAILS = {
+  price: {
+    label: 'Price Fairness',
+    description: 'Compares the current price to recent market listings to gauge if you are paying below, at, or above market value.'
+  },
+  sentiment: {
+    label: 'Review Sentiment',
+    description: 'Looks at average customer ratings and feedback volume to judge how satisfied buyers are with this item.'
+  },
+  seller: {
+    label: 'Seller Reliability',
+    description: 'Evaluates seller ratings and feedback to estimate trustworthiness and fulfillment risk.'
+  },
+  spec: {
+    label: 'Spec Confidence',
+    description: 'Checks specification matches, conflicts, and missing details to ensure the item aligns with expectations.'
+  }
+};
+
+function buildBuyScoreInfoWidgets(buyScore) {
+  if (!buyScore || typeof buyScore !== 'object') {
+    return { buttonHtml: '', panelHtml: '' };
+  }
+
+  const breakdown = buyScore.breakdown || {};
+  const weights = buyScore.weights || {};
+  const keys = Object.keys(breakdown);
+
+  if (!keys.length) {
+    return { buttonHtml: '', panelHtml: '' };
+  }
+
+  const infoId = `buyScoreInfo_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const scoreTotal = typeof buyScore.total === 'number' ? buyScore.total : null;
+
+  const rowsHtml = keys
+    .map((key) => {
+      const value = typeof breakdown[key] === 'number' ? breakdown[key] : null;
+      if (value == null) return '';
+      const weight = typeof weights[key] === 'number' ? weights[key] : null;
+      const factor = BUY_SCORE_FACTOR_DETAILS[key] || {
+        label: key.charAt(0).toUpperCase() + key.slice(1),
+        description: ''
+      };
+      const weightLabel = weight != null ? `${Math.round(weight * 100)}% weight` : 'Not weighted';
+      const scoreOutOfTen = (value * 10).toFixed(1);
+      const scorePercent = Math.max(0, Math.min(100, Math.round(value * 100)));
+      return `
+        <div class="buy-score-info-item">
+          <div class="buy-score-info-row">
+            <span>${factor.label}</span>
+            <span>${scoreOutOfTen}/10 • ${weightLabel}</span>
+          </div>
+          <div class="buy-score-info-bar">
+            <div class="buy-score-info-bar-fill" style="width:${scorePercent}%;"></div>
+          </div>
+          <div class="buy-score-info-description">${factor.description}</div>
+        </div>
+      `;
+    })
+    .filter(Boolean)
+    .join('');
+
+  const fallbackNote = buyScore.isFallback
+    ? '<div class="buy-score-info-note">Fallback scoring is enabled because we could not find enough exact matches. We lean more on price trends and sentiment.</div>'
+    : '';
+
+  const panelHtml = `
+    <div id="${infoId}" class="buy-score-info-modal" role="dialog" aria-modal="true" aria-hidden="true" data-visible="false">
+      <div class="buy-score-info-card" role="document" tabindex="-1">
+        <div class="buy-score-info-header">
+          <span>How this score was calculated${scoreTotal != null ? ` (${scoreTotal.toFixed(1)}/10)` : ''}</span>
+          <button type="button" class="buy-score-info-close" data-close-modal aria-label="Close Buy Score breakdown">&times;</button>
+        </div>
+        <div class="buy-score-info-body">
+          ${fallbackNote}
+          ${rowsHtml || '<div class="buy-score-info-description">No detailed breakdown available.</div>'}
+        </div>
+      </div>
+    </div>
+  `;
+
+  const buttonHtml = `
+    <button class="buy-score-info-btn" type="button" aria-label="Show Buy Score breakdown" aria-expanded="false" data-target="${infoId}">
+      <span aria-hidden="true">ⓘ</span>
+    </button>
+  `;
+
+  return { buttonHtml, panelHtml };
+}
+
 /**
  * Render Buy Score card
  */
@@ -525,6 +626,7 @@ function renderBuyScore(buyScore, recommendation) {
 
   // Calculate rotation for the needle (0% = -90deg, 100% = 90deg)
   const rotation = -90 + (percentage * 1.8);
+  const infoWidgets = buildBuyScoreInfoWidgets(buyScore);
 
   return `
     <div class="buy-score-card">
@@ -569,8 +671,11 @@ function renderBuyScore(buyScore, recommendation) {
 
         <!-- Score value display -->
         <div style="text-align: center; margin-top: 0px;">
-          <div style="font-size: 36px; font-weight: 700; color: ${recommendation.color};">
-            ${score.toFixed(1)}
+          <div style="display: flex; align-items: center; justify-content: center; gap: 8px;">
+            <div style="font-size: 36px; font-weight: 700; color: ${recommendation.color};">
+              ${score.toFixed(1)}
+            </div>
+            ${infoWidgets.buttonHtml}
           </div>
           <div style="font-size: 16px; font-weight: 600; color: ${recommendation.color}; margin-top: 4px;">
             ${recommendation.verdict}
@@ -580,6 +685,7 @@ function renderBuyScore(buyScore, recommendation) {
           </div>
         </div>
       </div>
+      ${infoWidgets.panelHtml}
     </div>
   `;
 }
@@ -621,6 +727,8 @@ function renderPriceComparison(priceData) {
       ? `$${priceValue.toFixed(2)}`
       : (comp.priceFormatted || comp.formattedPrice || comp.price || 'N/A');
     const listingFormat = comp.listingFormat || comp.format || comp.listingType || null;
+    const normalizedFormat =
+      typeof listingFormat === 'string' && listingFormat.length ? listingFormat.toLowerCase() : null;
     const bidCount =
       typeof comp.bidCount === 'number'
         ? comp.bidCount
@@ -638,9 +746,10 @@ function renderPriceComparison(priceData) {
       url: comp.url || comp.link || '',
       description: comp.description || '',
       type: 'listing',
-      listingFormat: listingFormat || (comp.isAuction ? 'auction' : null),
+      listingFormat: normalizedFormat || (comp.isAuction ? 'auction' : null),
       bidCount: typeof bidCount === 'number' ? bidCount : null,
-      timeLeft: typeof timeLeft === 'string' ? timeLeft : null
+      timeLeft: typeof timeLeft === 'string' ? timeLeft : null,
+      isAuction: normalizedFormat === 'auction' || comp.isAuction === true
     };
   }).filter(item => item.title || item.priceLabel);
 
@@ -687,46 +796,124 @@ function renderPriceComparison(priceData) {
 
   const comparablesCountDisplay = comparablesForUi.length || priceData.compCount || 0;
   const comparablesDataAttr = JSON.stringify(comparablesForUi).replace(/'/g, '&apos;');
+  const formatBreakdown = priceData.formatBreakdown || null;
+  const buyNowCount = formatBreakdown?.buyItNow ?? 0;
+  const auctionCount = formatBreakdown?.auction ?? 0;
+  const unknownCount = formatBreakdown?.unknown ?? 0;
+  const usedAuctionPrices = Boolean(priceData.usedAuctionPrices);
+
+  let comparablesMixNote = '';
+  const summaryParts = [];
+  if (buyNowCount) {
+    summaryParts.push(`${buyNowCount} Buy It Now`);
+  }
+  if (auctionCount) {
+    summaryParts.push(`${auctionCount} auction${auctionCount === 1 ? '' : 's'}`);
+  }
+  if (!summaryParts.length && unknownCount && comparablesCountDisplay) {
+    summaryParts.push(`${comparablesCountDisplay} listings`);
+  }
+
+  if (summaryParts.length) {
+    const auctionDetail = auctionCount
+      ? usedAuctionPrices
+        ? 'Auctions included because there were limited fixed-price results.'
+        : 'Auctions excluded from price stats; shown for context only.'
+      : '';
+    comparablesMixNote = `
+      <div style="margin-top: 12px; font-size: 11px; color: var(--text-secondary); text-align: center; line-height: 1.5;">
+        Comparables mix: ${summaryParts.join(' • ')}${auctionDetail ? `<br>${auctionDetail}` : ''}
+      </div>
+    `;
+  }
+
+  const matchDescription = priceData.matchDescription || '';
+  const mismatchWarning = priceData.mismatchWarning || '';
+  let matchQualityNote = '';
+
+  if (matchDescription) {
+    matchQualityNote += `
+      <div style="margin-top: 8px; font-size: 11px; color: var(--text-secondary); text-align: center; line-height: 1.5;">
+        ${matchDescription}
+      </div>
+    `;
+  }
+
+  if (mismatchWarning) {
+    matchQualityNote += `
+      <div style="margin-top: 8px; font-size: 11px; color: #b45309; background: rgba(251, 191, 36, 0.18); border: 1px solid rgba(251, 191, 36, 0.4); padding: 8px 10px; border-radius: 6px;">
+        ${mismatchWarning}
+      </div>
+    `;
+  }
 
   // Calculate positions on the number line
   let lineHtml = '';
   if (current != null && median != null && min != null && max != null) {
-    // Determine the range for the number line
-    const rangeMin = Math.min(min, current) * 0.9; // Add 10% padding
-    const rangeMax = Math.max(max, current) * 1.1;
-    const range = rangeMax - rangeMin;
+    // Determine the range for the number line with padding and current price inclusion
+    const numericValues = [min, max, median, current].filter(
+      (value) => typeof value === 'number' && Number.isFinite(value)
+    );
 
-    // Calculate percentage positions
-    const currentPos = ((current - rangeMin) / range) * 100;
-    const medianPos = ((median - rangeMin) / range) * 100;
-    const minPos = ((min - rangeMin) / range) * 100;
-    const maxPos = ((max - rangeMin) / range) * 100;
+    if (numericValues.length >= 2) {
+      let rangeMinValue = Math.min(...numericValues);
+      let rangeMaxValue = Math.max(...numericValues);
 
-    const clampPos = (value) => Math.max(0, Math.min(100, value));
-    const currentClamped = clampPos(currentPos);
-    const medianClamped = clampPos(medianPos);
-    const minClamped = clampPos(minPos);
-    const maxClamped = clampPos(maxPos);
+      if (rangeMinValue === rangeMaxValue) {
+        rangeMaxValue = rangeMinValue + Math.max(Math.abs(rangeMinValue) * 0.1, 1);
+      }
 
-    const diffFromMedian = current - median;
-    const tolerance = median != null ? Math.max(median * 0.015, 2) : 3;
-    const withinTolerance = Math.abs(diffFromMedian) <= tolerance;
+      const padding = Math.max((rangeMaxValue - rangeMinValue) * 0.12, 1);
+      const rangeMin = Math.max(0, rangeMinValue - padding);
+      const rangeMax = rangeMaxValue + padding;
+      const range = rangeMax - rangeMin;
 
-    let priceStatus = 'Above Market';
-    let priceStatusClass = 'badge-danger';
-    let currentColor = 'var(--negative-strong)';
+      const hasComparableMin = typeof min === 'number' && Number.isFinite(min);
+      const hasComparableMax = typeof max === 'number' && Number.isFinite(max);
 
-    if (withinTolerance) {
-      priceStatus = 'At Market';
-      priceStatusClass = 'badge-info';
-      currentColor = 'var(--accent-strong)';
-    } else if (current < median - tolerance) {
-      priceStatus = 'Below Market';
-      priceStatusClass = 'badge-success';
-      currentColor = 'var(--positive-strong)';
-    }
+      const displayBestValue = Math.min(
+        hasComparableMin ? min : current,
+        current
+      );
+      const displayWorstValue = Math.max(
+        hasComparableMax ? max : current,
+        current
+      );
 
-    lineHtml = `
+      // Calculate percentage positions
+      const currentPos = ((current - rangeMin) / range) * 100;
+      const medianPos = ((median - rangeMin) / range) * 100;
+      const minPos = ((displayBestValue - rangeMin) / range) * 100;
+      const maxPos = ((displayWorstValue - rangeMin) / range) * 100;
+
+      const clampPos = (value) => Math.max(0, Math.min(100, value));
+      const currentClamped = clampPos(currentPos);
+      const medianClamped = clampPos(medianPos);
+      const minClamped = clampPos(minPos);
+      const maxClamped = clampPos(maxPos);
+
+      const diffFromMedian = current - median;
+      const tolerance = median != null ? Math.max(median * 0.015, 2) : 3;
+      const withinTolerance = Math.abs(diffFromMedian) <= tolerance;
+
+      let priceStatus = 'Above Market';
+      let priceStatusClass = 'badge-danger';
+      let currentColor = 'var(--negative-strong)';
+
+      if (withinTolerance) {
+        priceStatus = 'At Market';
+        priceStatusClass = 'badge-info';
+        currentColor = 'var(--accent-strong)';
+      } else if (current < median - tolerance) {
+        priceStatus = 'Below Market';
+        priceStatusClass = 'badge-success';
+        currentColor = 'var(--positive-strong)';
+      }
+
+      const minOverlapOffset = Math.abs(minClamped - medianClamped) < 6 ? 8 : 0;
+      const maxOverlapOffset = Math.abs(maxClamped - medianClamped) < 6 ? 8 : 0;
+
+      lineHtml = `
       <div style="margin: 20px 0 24px 0;">
         <!-- Status badge -->
         <div style="text-align: center; margin-bottom: 12px;">
@@ -748,13 +935,13 @@ function renderPriceComparison(priceData) {
           <!-- Min marker -->
           <div style="position: absolute; left: ${minClamped}%; top: 64px; transform: translateX(-50%);">
             <div style="width: 2px; height: 8px; background: var(--text-secondary); margin: 0 auto;"></div>
-            <div style="font-size: 10px; color: var(--text-secondary); margin-top: 4px; white-space: nowrap;">Best<br>${formatPrice(min)}</div>
+            <div style="font-size: 10px; color: var(--text-secondary); margin-top: ${4 + minOverlapOffset}px; white-space: nowrap;">Best<br>${formatPrice(displayBestValue)}</div>
           </div>
 
           <!-- Max marker -->
           <div style="position: absolute; left: ${maxClamped}%; top: 64px; transform: translateX(-50%);">
             <div style="width: 2px; height: 8px; background: var(--text-secondary); margin: 0 auto;"></div>
-            <div style="font-size: 10px; color: var(--text-secondary); margin-top: 4px; white-space: nowrap;">Worst<br>${formatPrice(max)}</div>
+            <div style="font-size: 10px; color: var(--text-secondary); margin-top: ${4 + maxOverlapOffset}px; white-space: nowrap;">Worst<br>${formatPrice(displayWorstValue)}</div>
           </div>
 
           <!-- Median marker -->
@@ -787,9 +974,33 @@ function renderPriceComparison(priceData) {
         </div>
       </div>
 
+      ${comparablesMixNote}${matchQualityNote}
+
       <!-- Comparables list (initially hidden) -->
       <div id="comparablesList" style="display: none;"></div>
     `;
+    } else {
+      lineHtml = `
+        <div class="price-comparison">
+          <div class="price-item">
+            <div class="price-label">Current Price</div>
+            <div class="price-value">${formatPrice(current)}</div>
+          </div>
+          <div class="price-item">
+            <div class="price-label">Market Median</div>
+            <div class="price-value">${formatPrice(median)}</div>
+          </div>
+          <div class="price-item">
+            <div class="price-label">Best Price</div>
+            <div class="price-value">${formatPrice(min)}</div>
+          </div>
+        <div class="price-item">
+          <div class="price-label">Comparables</div>
+          <div class="price-value">${comparablesCountDisplay}</div>
+        </div>
+      </div>
+      `;
+    }
   } else {
     // Fallback to grid layout if we don't have enough data for the line
     lineHtml = `
@@ -811,6 +1022,7 @@ function renderPriceComparison(priceData) {
         <div class="price-value">${comparablesCountDisplay}</div>
       </div>
     </div>
+    ${comparablesMixNote}${matchQualityNote}
   `;
   }
 
@@ -859,42 +1071,56 @@ function renderReviewHighlights(product) {
     const numberRating = typeof review.rating === 'number' ? review.rating : null;
     const ratingLabel = numberRating != null ? `${numberRating.toFixed(1)}/5` : '';
     const ratingDisplay = ratingLabel || 'Rating unavailable';
-    const helpful = typeof review.helpfulCount === 'number' ? `${review.helpfulCount} found helpful` : '';
-    const badgeElements = (review.badges || []).map(badge => `<span class="badge badge-info">${badge}</span>`).join('');
-    const highlightButton = review.selector
-      ? `<button class="link-button review-highlight-btn" data-highlight-selector="${review.selector}">📍 View on page</button>`
+    const helpful = typeof review.helpfulCount === 'number' && review.helpfulCount > 0
+      ? `${review.helpfulCount} found helpful`
       : '';
     const bodyText = review.body || 'No review text available.';
     const normalizedTitle = (review.title || '').trim();
     const titleLooksLikeRating = normalizedTitle && normalizedTitle.toLowerCase().includes('out of 5');
-    const titleHtml = normalizedTitle && !titleLooksLikeRating
-      ? `<div style="font-weight: 600; color: var(--text-primary);">${normalizedTitle}</div>`
+    const titleSpan = normalizedTitle && !titleLooksLikeRating
+      ? `<span class="review-summary-title">${normalizedTitle}</span>`
       : '';
+
     const metaParts = [];
     if (review.author) metaParts.push(`by ${review.author}`);
     if (helpful) metaParts.push(helpful);
     const metaLine = metaParts.length
-      ? `<div style="font-size: 12px; color: var(--text-secondary); display: flex; flex-wrap: wrap; gap: 12px;">${metaParts.map(part => `<span>${part}</span>`).join('')}</div>`
+      ? `<div class="review-summary-meta">${metaParts.map(part => `<span>${part}</span>`).join('<span>•</span>')}</div>`
       : '';
+
+    const badgeElements = (review.badges || []).map(badge => `<span class="badge badge-info">${badge}</span>`).join('');
     const badgeLine = badgeElements
-      ? `<div style="margin-top: 6px; display: flex; flex-wrap: wrap; gap: 8px;">${badgeElements}</div>`
+      ? `<div class="review-summary-badges">${badgeElements}</div>`
+      : '';
+
+    const formattedDate = formatReviewDate(review.date);
+    const dateHtml = formattedDate
+      ? `<span class="review-summary-date">${formattedDate}</span>`
+      : '';
+
+    const highlightButton = review.selector
+      ? `<button class="review-highlight-btn" data-highlight-selector="${review.selector}">View this section on the page</button>`
       : '';
 
     return `
-      <details class="review-highlight" style="padding: 12px; margin-bottom: 12px;">
-        <summary style="cursor: pointer; display: flex; flex-direction: column; gap: 8px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
-            <div style="display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--accent-strong);">
-              ${ratingDisplay}
+      <details class="review-highlight">
+        <summary class="review-summary">
+          <span class="review-summary-chevron" aria-hidden="true">▸</span>
+          <div class="review-summary-content">
+            <div class="review-summary-header">
+              <div class="review-summary-header-main">
+                <span class="review-rating-badge">${ratingDisplay}</span>
+                ${titleSpan}
+              </div>
+              ${dateHtml}
             </div>
-            <div style="font-size: 12px; color: var(--text-secondary);">${review.date || ''}</div>
+            ${metaLine}
+            ${badgeLine}
+            <div class="review-summary-hint">Click to expand and read the full review</div>
           </div>
-          ${titleHtml}
-          ${metaLine}
-          ${badgeLine}
         </summary>
-        <div style="margin-top: 10px; font-size: 13px; line-height: 1.6;">${bodyText}</div>
-        <div style="margin-top: 10px;">${highlightButton}</div>
+        <div class="review-body">${bodyText}</div>
+        ${highlightButton ? `<div class="review-actions">${highlightButton}</div>` : ''}
       </details>
     `;
   }).join('');
@@ -905,6 +1131,31 @@ function renderReviewHighlights(product) {
       <div>${reviewItems}</div>
     </div>
   `;
+}
+
+function formatReviewDate(rawDate) {
+  if (!rawDate || typeof rawDate !== 'string') {
+    return '';
+  }
+
+  const trimmed = rawDate.trim();
+  const stripped = trimmed.replace(/^Reviewed in\s.+\son\s+/i, '').trim();
+  const candidate = stripped || trimmed;
+
+  const parsed = Date.parse(candidate);
+  if (!Number.isNaN(parsed)) {
+    try {
+      return new Date(parsed).toLocaleDateString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric'
+      });
+    } catch {
+      return candidate;
+    }
+  }
+
+  return candidate;
 }
 
 function renderExternalReviewIntel(externalReviews) {
@@ -1100,6 +1351,7 @@ function renderDealSense(dealSense, productData, buyScore, recommendation) {
     const score = buyScore.total || 0;
     const percentage = (score / 10) * 100; // Convert 0-10 score to 0-100%
     const rotation = -90 + (percentage * 1.8);
+    const infoWidgets = buildBuyScoreInfoWidgets(buyScore);
 
     html += `
       <div style="margin-bottom: 20px;">
@@ -1144,8 +1396,11 @@ function renderDealSense(dealSense, productData, buyScore, recommendation) {
 
           <!-- Score value display -->
           <div style="text-align: center; margin-top: 0px;">
-            <div style="font-size: 36px; font-weight: 700; color: ${recommendation.color};">
-              ${score.toFixed(1)}
+            <div style="display: flex; align-items: center; justify-content: center; gap: 8px;">
+              <div style="font-size: 36px; font-weight: 700; color: ${recommendation.color};">
+                ${score.toFixed(1)}
+              </div>
+              ${infoWidgets.buttonHtml}
             </div>
             <div style="font-size: 16px; font-weight: 600; color: ${recommendation.color}; margin-top: 4px;">
               ${recommendation.verdict}
@@ -1156,6 +1411,7 @@ function renderDealSense(dealSense, productData, buyScore, recommendation) {
           </div>
         </div>
       </div>
+      ${infoWidgets.panelHtml}
     `;
   }
 
@@ -1479,6 +1735,28 @@ function attachComparablesEventListeners() {
             const url = comp.url && comp.url !== '#' ? comp.url : null;
             const source = comp.source ? `<div style="color: var(--text-secondary); font-size: 11px; margin-top: 2px;">${comp.source}</div>` : '';
             const description = comp.description ? `<div style="margin-top: 6px; font-size: 12px; color: var(--text-secondary);">${comp.description}</div>` : '';
+            const isStat = comp.type === 'stat';
+            let formatLabel = '';
+            if (!isStat) {
+              if (comp.listingFormat === 'auction' || comp.isAuction) {
+                const bidsLabel =
+                  typeof comp.bidCount === 'number'
+                    ? ` · ${comp.bidCount} bid${comp.bidCount === 1 ? '' : 's'}`
+                    : '';
+                formatLabel = `Auction${bidsLabel}`;
+              } else if (comp.listingFormat === 'buy_it_now') {
+                formatLabel = 'Buy It Now';
+              } else if (comp.listingFormat === 'best_offer') {
+                formatLabel = 'Buy It Now / Best Offer';
+              }
+            }
+            const timeLeftLabel = !isStat && comp.timeLeft ? `Time left ${comp.timeLeft}` : '';
+            const formatParts = [formatLabel, timeLeftLabel].filter(Boolean);
+            const formatLine = formatParts.length
+              ? `<div style="margin-top: 6px; font-size: 12px; color: var(--text-secondary); display: flex; flex-wrap: wrap; gap: 10px;">
+                ${formatParts.map(part => `<span>${part}</span>`).join('')}
+              </div>`
+              : '';
             const titleContent = url
               ? `<a href="${url}" target="_blank" rel="noopener" style="color: #1d4ed8; text-decoration: none;">${title}</a>`
               : `<span style="color: #1f2937;">${title}</span>`;
@@ -1495,6 +1773,7 @@ function attachComparablesEventListeners() {
                   <span style="color: var(--text-secondary);">Condition:</span>
                   <span style="font-weight: 500;">${condition}</span>
                 </div>
+                ${formatLine}
                 ${description}
               </div>
             `;
@@ -1574,6 +1853,89 @@ function attachDealSenseEventListeners() {
       }
     });
   });
+}
+
+function attachBuyScoreInfoHandlers() {
+  const buttons = document.querySelectorAll('.buy-score-info-btn');
+  const panels = document.querySelectorAll('.buy-score-info-modal');
+
+  if (!buttons.length || !panels.length) {
+    return;
+  }
+
+  let escListener = null;
+
+  const teardownEsc = () => {
+    if (escListener) {
+      document.removeEventListener('keydown', escListener);
+      escListener = null;
+    }
+  };
+
+  const hideAllPanels = () => {
+    panels.forEach((panel) => {
+      panel.dataset.visible = 'false';
+      panel.setAttribute('aria-hidden', 'true');
+    });
+    buttons.forEach((btn) => btn.setAttribute('aria-expanded', 'false'));
+    teardownEsc();
+    document.body.style.removeProperty('overflow');
+  };
+
+  const showPanel = (panel, button) => {
+    hideAllPanels();
+    panel.dataset.visible = 'true';
+    panel.setAttribute('aria-hidden', 'false');
+    button.setAttribute('aria-expanded', 'true');
+    document.body.style.overflow = 'hidden';
+
+    const focusTarget = panel.querySelector('.buy-score-info-card');
+    if (focusTarget) {
+      focusTarget.focus({ preventScroll: true });
+    }
+
+    if (!escListener) {
+      escListener = (event) => {
+        if (event.key === 'Escape') {
+          hideAllPanels();
+        }
+      };
+      document.addEventListener('keydown', escListener);
+    }
+  };
+
+  buttons.forEach((button) => {
+    const targetId = button.getAttribute('data-target');
+    const panel = targetId ? document.getElementById(targetId) : null;
+    if (!panel) {
+      return;
+    }
+
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      if (panel.dataset.visible === 'true') {
+        hideAllPanels();
+      } else {
+        showPanel(panel, button);
+      }
+    });
+
+    panel.addEventListener('click', (event) => {
+      if (event.target === panel) {
+        hideAllPanels();
+      }
+    });
+
+    const closeBtn = panel.querySelector('[data-close-modal]');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        hideAllPanels();
+      });
+    }
+  });
+
+  hideAllPanels();
 }
 
 /**

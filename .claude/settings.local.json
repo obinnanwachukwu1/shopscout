@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(node -c:*)"
+      "Bash(node -c:*)",
+      "Bash(ls:*)",
+      "Bash(npm install --save-dev lite-server)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []

@@ -20,6 +20,48 @@ const emptyState = document.getElementById('emptyState');
 const productBadge = document.getElementById('productBadge');
 const suggestedQuestions = document.querySelectorAll('.suggested-question');
 
+const SHOPSCOUT_ICON_SRC_16 = (typeof chrome !== 'undefined' && chrome.runtime?.getURL)
+  ? chrome.runtime.getURL('icons/icon16.png')
+  : 'icons/icon16.png';
+
+function setAvatarIcon(avatarEl, variant = 'assistant') {
+  if (!avatarEl) return;
+
+  avatarEl.innerHTML = '';
+  avatarEl.removeAttribute('data-variant');
+  avatarEl.classList.remove('avatar-user');
+
+  if (variant === 'user') {
+    avatarEl.textContent = 'You';
+    avatarEl.classList.add('avatar-user');
+    return;
+  }
+
+  const img = document.createElement('img');
+  img.src = SHOPSCOUT_ICON_SRC_16;
+  img.alt = 'ShopScout';
+  img.width = 20;
+  img.height = 20;
+  avatarEl.appendChild(img);
+  avatarEl.dataset.variant = variant;
+}
+
+const typingAvatar = typingIndicator?.querySelector('.message-avatar');
+if (typingAvatar) {
+  setAvatarIcon(typingAvatar, 'assistant');
+}
+
+function configureStatusDetails(entry, summaryText) {
+  if (!entry?.detailsEl) return;
+
+  const hasSummary = typeof summaryText === 'string' && summaryText.trim().length > 0;
+
+  entry.detailsBodyEl.textContent = hasSummary ? summaryText.trim() : '';
+  entry.detailsEl.hidden = !hasSummary;
+  entry.detailsEl.open = false;
+  entry.detailsSummaryEl.textContent = 'Show search summary';
+  entry.detailsSummaryEl.setAttribute('aria-expanded', 'false');
+}
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
   loadCurrentProduct();
@@ -186,6 +228,40 @@ async function handleSendMessage() {
   }
 }
 
+/**
+ * Simple markdown parser for light formatting
+ * Supports: **bold**, *italic*, and bullet lists (-)
+ */
+function parseMarkdown(text) {
+  if (!text || typeof text !== 'string') return text;
+
+  // Split into lines to handle bullet lists
+  const lines = text.split('\n');
+  const parsed = [];
+
+  for (const line of lines) {
+    // Check if line is a bullet point
+    const bulletMatch = line.match(/^\s*-\s+(.+)$/);
+    if (bulletMatch) {
+      parsed.push(`• ${bulletMatch[1]}`);
+      continue;
+    }
+
+    // Process inline formatting
+    let processedLine = line;
+
+    // Bold: **text** -> <strong>text</strong>
+    processedLine = processedLine.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+    // Italic: *text* -> <em>text</em>
+    processedLine = processedLine.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+    parsed.push(processedLine);
+  }
+
+  return parsed.join('\n');
+}
+
 function createSourceLink(source) {
   const sourceLink = document.createElement('div');
   sourceLink.className = 'message-source';
@@ -203,11 +279,18 @@ function addMessage(role, content, source = null) {
 
   const avatar = document.createElement('div');
   avatar.className = 'message-avatar';
-  avatar.textContent = role === 'user' ? '👤' : '🔍';
+  setAvatarIcon(avatar, role === 'user' ? 'user' : 'assistant');
 
   const messageContent = document.createElement('div');
   messageContent.className = 'message-content';
-  messageContent.textContent = content;
+
+  // Parse markdown for assistant messages
+  if (role === 'assistant') {
+    const parsedContent = parseMarkdown(content);
+    messageContent.innerHTML = parsedContent;
+  } else {
+    messageContent.textContent = content;
+  }
 
   // Add source link if available
   if (source && role === 'assistant') {
@@ -245,38 +328,41 @@ function handleToolCallEvent(event) {
   const queryText = event?.query ? `“${event.query}”` : event?.tool || 'tool';
 
   if (!entry) {
-    entry = createStatusMessage('🔍', `Searching for ${queryText}...`);
+    entry = createStatusMessage('status-search', `Searching for ${queryText}...`);
     toolStatusMessages.set(toolCallId, entry);
   }
 
   switch (event.status) {
     case 'start':
-      entry.avatarEl.textContent = '🔍';
+      setAvatarIcon(entry.avatarEl, 'status-search');
       entry.primaryEl.textContent = `Searching for ${queryText}...`;
       entry.secondaryEl.textContent = event.siteFilter ? `Site filter: ${event.siteFilter}` : '';
+      configureStatusDetails(entry, '');
       break;
     case 'complete':
-      entry.avatarEl.textContent = '✅';
+      setAvatarIcon(entry.avatarEl, 'status-success');
       entry.primaryEl.textContent = `Search complete for ${queryText}`;
-      entry.secondaryEl.textContent = event.summary || '';
+      entry.secondaryEl.textContent = '';
+      configureStatusDetails(entry, event.summary || '');
       break;
     case 'error':
-      entry.avatarEl.textContent = '⚠️';
+      setAvatarIcon(entry.avatarEl, 'status-error');
       entry.primaryEl.textContent = `Search failed for ${queryText}`;
       entry.secondaryEl.textContent = event.error || 'Unknown error';
+      configureStatusDetails(entry, '');
       break;
     default:
       break;
   }
 }
 
-function createStatusMessage(icon, primaryText, secondaryText = '') {
+function createStatusMessage(variant, primaryText, secondaryText = '') {
   const messageDiv = document.createElement('div');
   messageDiv.className = 'message status';
 
   const avatar = document.createElement('div');
   avatar.className = 'message-avatar';
-  avatar.textContent = icon;
+  setAvatarIcon(avatar, variant);
 
   const messageContent = document.createElement('div');
   messageContent.className = 'message-content';
@@ -289,8 +375,30 @@ function createStatusMessage(icon, primaryText, secondaryText = '') {
   secondaryEl.className = 'message-status-secondary';
   secondaryEl.textContent = secondaryText;
 
+  const detailsEl = document.createElement('details');
+  detailsEl.className = 'message-status-summary';
+  detailsEl.hidden = true;
+
+  const detailsSummaryEl = document.createElement('summary');
+  detailsSummaryEl.className = 'message-status-summary-toggle';
+  detailsSummaryEl.textContent = 'Show search summary';
+  detailsSummaryEl.setAttribute('aria-expanded', 'false');
+
+  const detailsBodyEl = document.createElement('div');
+  detailsBodyEl.className = 'message-status-summary-body';
+
+  detailsEl.appendChild(detailsSummaryEl);
+  detailsEl.appendChild(detailsBodyEl);
+
+  detailsEl.addEventListener('toggle', () => {
+    const expanded = detailsEl.open;
+    detailsSummaryEl.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    detailsSummaryEl.textContent = expanded ? 'Hide search summary' : 'Show search summary';
+  });
+
   messageContent.appendChild(primaryEl);
   messageContent.appendChild(secondaryEl);
+  messageContent.appendChild(detailsEl);
 
   messageDiv.appendChild(avatar);
   messageDiv.appendChild(messageContent);
@@ -298,7 +406,15 @@ function createStatusMessage(icon, primaryText, secondaryText = '') {
   chatMessages.insertBefore(messageDiv, typingIndicator);
   chatMessages.scrollTop = chatMessages.scrollHeight;
 
-  return { messageDiv, avatarEl: avatar, primaryEl, secondaryEl };
+  return {
+    messageDiv,
+    avatarEl: avatar,
+    primaryEl,
+    secondaryEl,
+    detailsEl,
+    detailsBodyEl,
+    detailsSummaryEl
+  };
 }
 
 function handleStreamStart(data = {}) {
@@ -320,7 +436,7 @@ function createStreamingMessage(streamId, source = null, search = null) {
 
   const avatar = document.createElement('div');
   avatar.className = 'message-avatar';
-  avatar.textContent = '🔍';
+  setAvatarIcon(avatar, 'assistant');
 
   const messageContent = document.createElement('div');
   messageContent.className = 'message-content';
@@ -376,7 +492,9 @@ function handleStreamEnd(data = {}) {
     ? data.fullAnswer
     : activeStream.textEl.textContent;
 
-  activeStream.textEl.textContent = finalAnswer;
+  // Parse markdown and render
+  const parsedAnswer = parseMarkdown(finalAnswer);
+  activeStream.textEl.innerHTML = parsedAnswer;
 
   const source = data?.source || activeStream.source || null;
   if (source) {

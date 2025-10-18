@@ -236,6 +236,83 @@ const extractProductOverview = () => {
   return overview;
 };
 
+const extractDetailMap = () => {
+  const map = new Map();
+  const addEntry = (label, value) => {
+    const cleanedLabel = clean(label)?.replace(/[:：]$/, '');
+    const cleanedValue = clean(value);
+    if (!cleanedLabel || !cleanedValue) return;
+    const normalizedKey = cleanedLabel.toLowerCase();
+    if (!map.has(normalizedKey)) {
+      map.set(normalizedKey, cleanedValue);
+    }
+  };
+
+  const bulletSelectors = ['#detailBullets_feature_div li', '#detailBulletsWrapper_feature_div li'];
+  bulletSelectors.forEach((selector) => {
+    document.querySelectorAll(selector).forEach((li) => {
+      const clone = li.cloneNode(true);
+      const labelNode = clone.querySelector('span.a-text-bold');
+      if (labelNode) {
+        const labelText = labelNode.textContent;
+        labelNode.remove();
+        addEntry(labelText, clone.textContent);
+      } else {
+        const text = clean(clone.textContent);
+        if (text && text.includes(':')) {
+          const [label, ...rest] = text.split(':');
+          addEntry(label, rest.join(':'));
+        }
+      }
+    });
+  });
+
+  const tableSelectors = [
+    '#productDetails_detailBullets_sections1 tr',
+    '#productDetails_detailBullets_sections2 tr',
+    '#productDetails_techSpec_section_1 tr',
+    '#productDetails_techSpec_section_2 tr'
+  ];
+
+  tableSelectors.forEach((selector) => {
+    document.querySelectorAll(selector).forEach((row) => {
+      const header = clean(row.querySelector('th')?.textContent);
+      const value = clean(row.querySelector('td')?.textContent);
+      if (header && value) {
+        addEntry(header, value);
+      }
+    });
+  });
+
+  return map;
+};
+
+const extractIdentifiersFromDetailMap = (detailMap) => {
+  if (!detailMap || detailMap.size === 0) {
+    return {};
+  }
+
+  const get = (...keys) => {
+    for (const key of keys) {
+      const normalized = key.toLowerCase();
+      if (detailMap.has(normalized)) {
+        return detailMap.get(normalized);
+      }
+    }
+    return null;
+  };
+
+  return {
+    isbn10: get('isbn-10', 'isbn10'),
+    isbn13: get('isbn-13', 'isbn13'),
+    upc: get('upc', 'upc-12'),
+    ean: get('ean', 'ean-13'),
+    gtin: get('gtin'),
+    modelNumber: get('item model number', 'model number', 'manufacturer part number', 'part number', 'mpn'),
+    sku: get('sku')
+  };
+};
+
 const extractRatings = () => {
   const ratingText = clean(document.querySelector('#acrPopover .a-icon-alt')?.textContent);
   const ratingValue = ratingText ? parseFloat((ratingText.match(/[\d.]+/) || [])[0]) : null;
@@ -395,6 +472,9 @@ window.extractAmazonProduct = () => {
     const badges = extractBadges();
     const description = clean(document.querySelector('#productDescription')?.textContent);
     const mainImage = extractMainImage();
+    const detailMap = extractDetailMap();
+    const identifierInfo = extractIdentifiersFromDetailMap(detailMap);
+    const asinList = asin ? [asin] : [];
 
     return {
       site: 'amazon',
@@ -424,6 +504,18 @@ window.extractAmazonProduct = () => {
       badges,
       productOverview,
       mainImage,
+      identifiers: {
+        asin,
+        asinList,
+        isbn10: identifierInfo.isbn10 || null,
+        isbn13: identifierInfo.isbn13 || null,
+        upc: identifierInfo.upc || null,
+        ean: identifierInfo.ean || null,
+        gtin: identifierInfo.gtin || null,
+        modelNumber: identifierInfo.modelNumber || null,
+        sku: identifierInfo.sku || null
+      },
+      modelNumber: identifierInfo.modelNumber || null,
       scrapedAt: Date.now()
     };
   } catch (error) {

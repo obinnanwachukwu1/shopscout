@@ -289,45 +289,69 @@ export class DealSense {
    * Generate Best Offer tiers based on seller signals
    */
   static generateBestOfferTiers(afp, sellerSignals, productData) {
-    if (!afp?.value) {
-      return null;
-    }
-
-    const baseValue = afp.value;
     const isDesperateList = sellerSignals.desperation === 'high';
     const isNewListing = sellerSignals.listingAge < 7;
 
-    // Adjust tiers based on seller desperation
+    const binPrice = this.extractBuyItNowPrice(productData);
+    const hasBin = typeof binPrice === 'number' && Number.isFinite(binPrice) && binPrice > 0;
+    const baseValue = hasBin ? Math.min(afp?.value || binPrice, binPrice * 1.1) : afp?.value;
+
+    if (!baseValue) {
+      return null;
+    }
+
     const tiers = {
       lowball: {
         label: 'Lowball',
         description: isDesperateList ? 'Seller likely motivated - worth trying' : 'May be rejected, but worth a shot',
-        multiplier: 0.60
+        multiplier: 0.60,
+        binPercent: 0.55
       },
       fair: {
         label: 'Fair Offer',
         description: 'Reasonable starting point for negotiation',
-        multiplier: 0.78
+        multiplier: 0.78,
+        binPercent: 0.72
       },
       strong: {
         label: 'Strong Offer',
         description: isNewListing ? 'Competitive for new listing' : 'High acceptance chance',
-        multiplier: 0.88
+        multiplier: 0.88,
+        binPercent: 0.88
       }
     };
 
     const offers = {};
+    const tierOrder = ['lowball', 'fair', 'strong'];
+    let previousAmount = 0;
 
-    Object.keys(tiers).forEach(key => {
+    tierOrder.forEach((key, index) => {
       const tier = tiers[key];
-      const rawOffer = baseValue * tier.multiplier;
-      const roundedOffer = Math.round(rawOffer); // Offers are usually whole dollars
+
+      let offerAmount = Math.round(baseValue * tier.multiplier);
+
+      if (hasBin) {
+        const percentOffer = Math.round(binPrice * tier.binPercent);
+        const minStep = binPrice >= 200 ? 5 : binPrice >= 50 ? 3 : binPrice >= 10 ? 2 : 1;
+        const ceiling = Math.max(1, Math.floor(binPrice - minStep));
+        offerAmount = Math.min(offerAmount, percentOffer, ceiling);
+
+        if (offerAmount <= 0) {
+          offerAmount = Math.max(1, Math.floor(binPrice * (tier.binPercent * 0.9)));
+        }
+      }
+
+      if (index > 0 && offerAmount <= previousAmount) {
+        offerAmount = Math.min(hasBin ? Math.floor(binPrice - 1) : offerAmount, previousAmount + 1);
+      }
+
+      previousAmount = offerAmount;
 
       offers[key] = {
         label: tier.label,
         description: tier.description,
-        amount: roundedOffer,
-        formatted: `$${roundedOffer.toFixed(2)}`,
+        amount: offerAmount,
+        formatted: `$${offerAmount.toFixed(2)}`,
         acceptance: this.estimateAcceptanceChance(tier.multiplier, sellerSignals)
       };
     });
@@ -336,6 +360,24 @@ export class DealSense {
       offers,
       recommended: isDesperateList ? 'lowball' : isNewListing ? 'strong' : 'fair'
     };
+  }
+
+  static extractBuyItNowPrice(productData) {
+    if (!productData) {
+      return null;
+    }
+
+    const price = productData.price;
+
+    if (typeof price?.value === 'number' && Number.isFinite(price.value)) {
+      return price.value;
+    }
+
+    if (typeof price?.current?.amount === 'number' && Number.isFinite(price.current.amount)) {
+      return price.current.amount;
+    }
+
+    return null;
   }
 
   /**

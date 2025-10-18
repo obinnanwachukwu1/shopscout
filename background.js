@@ -29,6 +29,159 @@ const EXTERNAL_REVIEW_TTL = 15 * 60 * 1000;
 const externalReviewCache = new Map();
 const externalReviewPending = new Map();
 
+const PRODUCT_URL_PATTERNS = {
+  amazon: /\/dp\/|\/gp\/product\//,
+  ebay: /\/itm\//
+};
+
+const RESCRAPE_DEBOUNCE_MS = 1500;
+
+let lastRescrapeKey = null;
+let lastRescrapeTimestamp = 0;
+
+function normalizeProductUrl(url) {
+  if (!url) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(url);
+    const normalizedPath = parsed.pathname.replace(/\/+$/, '');
+    const search = parsed.search || '';
+    return `${parsed.origin}${normalizedPath}${search}`;
+  } catch {
+    return null;
+  }
+}
+
+function detectSupportedProduct(url) {
+  if (!url) {
+    return null;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+
+  const { hostname, pathname } = parsed;
+
+  if (hostname === 'www.amazon.com' && PRODUCT_URL_PATTERNS.amazon.test(pathname)) {
+    return {
+      site: 'amazon',
+      normalizedUrl: normalizeProductUrl(url)
+    };
+  }
+
+  if (hostname === 'www.ebay.com' && PRODUCT_URL_PATTERNS.ebay.test(pathname)) {
+    return {
+      site: 'ebay',
+      normalizedUrl: normalizeProductUrl(url)
+    };
+  }
+
+  return null;
+}
+
+async function maybeTriggerRescrape(tabId, url, reason) {
+  const productInfo = detectSupportedProduct(url);
+  if (!productInfo?.normalizedUrl) {
+    return;
+  }
+
+  const currentUrl = normalizeProductUrl(currentAnalysis?.productData?.url);
+  const isSameProduct = currentUrl && currentUrl === productInfo.normalizedUrl;
+
+  if (isSameProduct) {
+    return;
+  }
+
+  const triggerKey = `${tabId}:${productInfo.normalizedUrl}`;
+  const now = Date.now();
+
+  if (lastRescrapeKey === triggerKey && now - lastRescrapeTimestamp < RESCRAPE_DEBOUNCE_MS) {
+    return;
+  }
+
+  if (currentUrl && currentUrl !== productInfo.normalizedUrl) {
+    currentAnalysis = null;
+    broadcastToSidepanel({
+      type: 'ANALYSIS_RESET',
+      data: {
+        reason,
+        site: productInfo.site,
+        url: productInfo.normalizedUrl
+      }
+    });
+  }
+
+  lastRescrapeKey = triggerKey;
+  lastRescrapeTimestamp = now;
+
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: 'RE_SCRAPE', reason });
+  } catch (error) {
+    const chromeError = chrome.runtime.lastError;
+    if (chromeError) {
+      console.debug('[Background] RE_SCRAPE send failed:', chromeError.message);
+    } else if (error) {
+      console.debug('[Background] RE_SCRAPE send failed:', error.message);
+    }
+  }
+}
+
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab?.url) {
+      return;
+    }
+
+    await maybeTriggerRescrape(tabId, tab.url, 'TAB_ACTIVATED');
+  } catch (error) {
+    console.debug('[Background] Failed to handle tab activation:', error?.message || error);
+  }
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  const relevantChange = changeInfo.status === 'complete' || Boolean(changeInfo.url);
+  if (!relevantChange) {
+    return;
+  }
+
+  const targetTab = tab || await chrome.tabs.get(tabId).catch(() => null);
+  if (!targetTab?.active) {
+    return;
+  }
+
+  const url = changeInfo.url || targetTab.url;
+  if (!url) {
+    return;
+  }
+
+  const reason = changeInfo.status === 'complete' ? 'TAB_UPDATED' : 'TAB_URL_CHANGED';
+  await maybeTriggerRescrape(tabId, url, reason);
+});
+
+chrome.windows.onFocusChanged.addListener(async (windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) {
+    return;
+  }
+
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, windowId });
+    if (!tab?.url) {
+      return;
+    }
+
+    await maybeTriggerRescrape(tab.id, tab.url, 'WINDOW_FOCUSED');
+  } catch (error) {
+    console.debug('[Background] Failed to handle window focus change:', error?.message || error);
+  }
+});
+
 function cloneProductData(productData) {
   if (productData == null) {
     return productData;

@@ -6,6 +6,38 @@
  * eBay product -> search Amazon via DuckDuckGo
  */
 
+const TITLE_STOP_WORDS = new Set([
+  'the',
+  'and',
+  'with',
+  'for',
+  'from',
+  'inch',
+  'inches',
+  'new',
+  'sale',
+  'best',
+  'bundle',
+  'pack',
+  'set',
+  'black',
+  'white',
+  'blue',
+  'store',
+  'free',
+  'shipping',
+  'edition',
+  'latest',
+  'model',
+  'updated',
+  'seller',
+  'listing',
+  'sealed',
+  'amazon',
+  'ebay',
+  'official'
+]);
+
 export class PriceComparison {
   /**
    * Fetch comparable prices from the other site
@@ -21,9 +53,9 @@ export class PriceComparison {
     });
 
     if (productData.site === 'amazon') {
-      return await this.searchViaDuckDuckGo(searchQuery, 'ebay.com');
+      return await this.searchViaDuckDuckGo(searchQuery, 'ebay.com', productData);
     } else {
-      return await this.searchViaDuckDuckGo(searchQuery, 'amazon.com');
+      return await this.searchViaDuckDuckGo(searchQuery, 'amazon.com', productData);
     }
   }
 
@@ -36,21 +68,21 @@ export class PriceComparison {
     }
 
     const searchQuery = this.cleanTitleForSearch(productData.title);
-    return await this.searchEbaySoldListings(searchQuery);
+    return await this.searchEbaySoldListings(searchQuery, productData);
   }
 
   /**
    * Search via DuckDuckGo with site filter
    */
-  static async searchViaDuckDuckGo(query, site) {
+  static async searchViaDuckDuckGo(query, site, productData) {
     try {
       console.log('[Price Search] Attempting direct site search instead of DuckDuckGo');
 
       // Use direct site search instead of DuckDuckGo
       if (site.includes('ebay')) {
-        return await this.searchEbayDirect(query);
+        return await this.searchEbayDirect(query, productData);
       } else if (site.includes('amazon')) {
-        return await this.searchAmazonDirect(query);
+        return await this.searchAmazonDirect(query, productData);
       }
 
       return this.getEmptyPriceData();
@@ -63,7 +95,7 @@ export class PriceComparison {
   /**
    * Search Amazon directly
    */
-  static async searchAmazonDirect(query) {
+  static async searchAmazonDirect(query, productData) {
     try {
       const encodedQuery = encodeURIComponent(query);
       const searchUrl = `https://www.amazon.com/s?k=${encodedQuery}`;
@@ -86,28 +118,97 @@ export class PriceComparison {
 
       // Extract prices and comparable listings from Amazon search results
       const prices = this.extractAmazonPrices(html);
-      const listingComparables = this.extractAmazonListingSummaries(html);
-      const listingPrices = listingComparables.map(item => item.priceValue).filter(value => typeof value === 'number');
+      let listingComparables = this.extractAmazonListingSummaries(html);
+      const derivedFromPrices = listingComparables.length === 0 && prices.length > 0;
+
+      if (derivedFromPrices) {
+        listingComparables = prices
+          .filter((value) => typeof value === 'number' && value > 0 && value < 100000)
+          .slice(0, 6)
+          .map((value, index) =>
+            this.buildComparableEntry({
+              url: `${searchUrl}#price-only-${index}`,
+              priceValue: value,
+              site: 'amazon',
+              source: 'price-only',
+              title: `${productData?.title || query} (similar listing)`,
+              description: 'Constructed from Amazon search price results (fallback).'
+            })
+          )
+          .filter(Boolean);
+      }
 
       console.log('[Amazon Search] Extracted prices:', prices);
       console.log('[Amazon Search] Listing comparables:', listingComparables.length);
 
-      const combinedPrices = [...prices, ...listingPrices];
-      const filteredPrices = [...new Set(combinedPrices.filter(value => value > 0 && value < 100000))];
-      if (filteredPrices.length === 0) {
-        console.log('[Amazon Search] No valid prices extracted');
-        return this.getEmptyPriceData();
+      const filterResult = this.filterComparablesByIdentity(listingComparables, productData);
+      if (derivedFromPrices && filterResult.filtered.length) {
+        if (filterResult.quality !== 'identifier') {
+          filterResult.quality = 'fallback';
+        }
+        filterResult.details = filterResult.details
+          ? `${filterResult.details} (price-only fallback)`
+          : 'Price-only fallback comparables were used.';
       }
-      const range = this.calculateIqrRange(filteredPrices);
+      const filteredComparables = filterResult.filtered;
+
+      if (!filteredComparables.length) {
+        const baseDescription = derivedFromPrices
+          ? 'Structured listings unavailable; using price-only fallback entries.'
+          : null;
+        const matchDescription = [baseDescription, filterResult.details].filter(Boolean).join(' ');
+        console.log('[Amazon Search] No comparables after filtering:', filterResult.details);
+        return this.getEmptyPriceData({
+          source: 'amazon',
+          matchQuality: filterResult.quality,
+          matchDescription,
+          mismatchWarning:
+            filterResult.quality === 'weak' || filterResult.quality === 'fallback' || derivedFromPrices
+              ? 'Comparable matches are approximate; treat this price comparison cautiously.'
+              : 'No close Amazon listings matched this product.'
+        });
+      }
+
+      const priceValues = filteredComparables
+        .map(item => item.priceValue)
+        .filter(value => typeof value === 'number' && value > 0 && value < 100000);
+
+      if (!priceValues.length) {
+        console.log('[Amazon Search] No usable prices from filtered comparables');
+        return this.getEmptyPriceData({
+          source: 'amazon',
+          matchQuality: filterResult.quality,
+          matchDescription: filterResult.details,
+          mismatchWarning: 'Unable to extract prices from matching Amazon listings.'
+        });
+      }
+
+      const uniquePrices = [...new Set(priceValues)];
+      const range = this.calculateIqrRange(uniquePrices);
+      const pricesForStats = range.filtered.length ? range.filtered : uniquePrices;
+
+      const baseDescription = derivedFromPrices
+        ? 'Structured listings unavailable; using price-only fallback entries.'
+        : null;
+      const combinedDescription = [baseDescription, filterResult.details].filter(Boolean).join(' ');
+
       return {
-        prices: filteredPrices,
-        median: this.calculateMedian(filteredPrices),
+        prices: pricesForStats,
+        median: this.calculateMedian(pricesForStats),
         min: range.min,
         max: range.max,
-        compCount: listingComparables.length || filteredPrices.length,
+        compCount: filteredComparables.length || pricesForStats.length,
         currentPrice: null,
         source: 'amazon',
-        comparables: listingComparables
+        comparables: filteredComparables,
+        matchQuality: filterResult.quality,
+        matchDescription: combinedDescription || filterResult.details,
+        mismatchWarning:
+          filterResult.quality === 'weak'
+            ? 'Only loosely matching Amazon listings were found.'
+            : filterResult.quality === 'fallback'
+              ? 'Comparable matches are approximate; treat this price comparison cautiously.'
+              : null
       };
     } catch (error) {
       console.error('[Amazon Search] Error:', error);
@@ -118,7 +219,7 @@ export class PriceComparison {
   /**
    * Search eBay directly
    */
-  static async searchEbayDirect(query) {
+  static async searchEbayDirect(query, productData) {
     try {
       const encodedQuery = encodeURIComponent(query);
       const searchUrl = `https://www.ebay.com/sch/i.html?_nkw=${encodedQuery}`;
@@ -142,62 +243,71 @@ export class PriceComparison {
       // Extract prices and comparable listings from eBay search results
       const prices = this.extractEbayPrices(html);
       const listingComparables = this.extractEbayListingSummaries(html);
-      const listingPrices = listingComparables.map(item => item.priceValue).filter(value => typeof value === 'number');
 
       console.log('[eBay Search] Extracted prices:', prices);
       console.log('[eBay Search] Listing comparables:', listingComparables.length);
 
+      const filterResult = this.filterComparablesByIdentity(listingComparables, productData);
+      const filteredComparables = filterResult.filtered;
+
+      if (!filteredComparables.length) {
+        console.log('[eBay Search] No comparables after filtering:', filterResult.details);
+        return await this.searchEbayViaDuckDuckGo(query, productData, {
+          fallbackReason: filterResult.details,
+          matchQuality: filterResult.quality
+        });
+      }
+
       const isValidPrice = (value) => typeof value === 'number' && value > 0 && value < 100000;
-      const auctionComparables = listingComparables.filter(item => item?.listingFormat === 'auction');
-      const buyNowComparables = listingComparables.filter(
+      const priceValues = filteredComparables.map(item => item.priceValue).filter(isValidPrice);
+      if (!priceValues.length) {
+        console.log('[eBay Search] No usable prices from filtered comparables');
+        return await this.searchEbayViaDuckDuckGo(query, productData, {
+          fallbackReason: 'Filtered eBay listings had no price values.',
+          matchQuality: filterResult.quality
+        });
+      }
+
+      const uniquePrices = [...new Set(priceValues)];
+      const range = this.calculateIqrRange(uniquePrices);
+      const pricesForStats = range.filtered.length ? range.filtered : uniquePrices;
+
+      const buyNowComparables = filteredComparables.filter(
         item => item?.listingFormat && item.listingFormat !== 'auction'
       );
-      const unknownComparables = listingComparables.filter(item => !item?.listingFormat);
+      const auctionComparables = filteredComparables.filter(item => item?.listingFormat === 'auction');
+      const unknownComparables = filteredComparables.filter(item => !item?.listingFormat);
+      const usedAuctionPrices = buyNowComparables.length === 0 && auctionComparables.length > 0;
 
-      const buyNowPrices = buyNowComparables.map(item => item.priceValue).filter(isValidPrice);
-      const comparablePrices = listingComparables.map(item => item.priceValue).filter(isValidPrice);
-
-      const prioritizedPriceList = [];
-      prioritizedPriceList.push(...buyNowPrices);
-      if (prioritizedPriceList.length < 3) {
-        prioritizedPriceList.push(...comparablePrices);
-      }
-      if (prioritizedPriceList.length < 3) {
-        prioritizedPriceList.push(...prices.filter(isValidPrice));
-      }
-
-      const effectivePrices = [...new Set(prioritizedPriceList.filter(isValidPrice))];
-      if (effectivePrices.length === 0) {
-        console.log('[eBay Search] No usable prices after filtering, falling back to DuckDuckGo');
-        return await this.searchEbayViaDuckDuckGo(query);
-      }
-
-      const range = this.calculateIqrRange(effectivePrices);
-      const pricesForStats = range.filtered.length ? range.filtered : effectivePrices;
-      const usedAuctionPrices = buyNowPrices.length < 3 && auctionComparables.length > 0;
       return {
         prices: pricesForStats,
         median: this.calculateMedian(pricesForStats),
         min: range.min,
         max: range.max,
-        compCount: listingComparables.length || pricesForStats.length,
+        compCount: filteredComparables.length || pricesForStats.length,
         currentPrice: null,
         source: 'ebay',
-        comparables: listingComparables,
+        comparables: filteredComparables,
         formatBreakdown: {
           buyItNow: buyNowComparables.length,
           auction: auctionComparables.length,
           unknown: unknownComparables.length
         },
-        usedAuctionPrices
+        usedAuctionPrices,
+        matchQuality: filterResult.quality,
+        matchDescription: filterResult.details,
+        mismatchWarning:
+          filterResult.quality === 'weak'
+            ? 'Only loosely matching eBay listings were found.'
+            : null
       };
     } catch (error) {
       console.error('[eBay Search] Error:', error);
-      return await this.searchEbayViaDuckDuckGo(query);
+      return await this.searchEbayViaDuckDuckGo(query, productData);
     }
   }
 
-  static async searchEbayViaDuckDuckGo(query) {
+  static async searchEbayViaDuckDuckGo(query, productData, options = {}) {
     try {
       const encodedQuery = encodeURIComponent(`${query} site:ebay.com`);
       const searchUrl = `https://html.duckduckgo.com/html/?q=${encodedQuery}`;
@@ -215,28 +325,73 @@ export class PriceComparison {
 
       const html = await response.text();
       const urls = this.extractUrlsFromDDG(html, 'ebay.com');
-      const { prices, comparables } = await this.extractPricesFromUrls(urls, 'ebay.com');
+      const { prices, comparables } = await this.extractPricesFromUrls(urls, 'ebay.com', productData);
 
-      const range = this.calculateIqrRange(prices);
+      const filterResult = this.filterComparablesByIdentity(comparables, productData);
+      const filteredComparables = filterResult.filtered;
+      const combinedQuality = filterResult.quality || options.matchQuality || 'none';
+
+      if (!filteredComparables.length) {
+        return this.getEmptyPriceData({
+          source: 'ebay',
+          matchQuality: combinedQuality,
+          matchDescription: filterResult.details || options.fallbackReason || 'No comparable listings matched this product.',
+          mismatchWarning: 'Unable to find matching eBay listings for this product.'
+        });
+      }
+
+      const priceValues = filteredComparables
+        .map(item => item.priceValue)
+        .filter(value => typeof value === 'number' && value > 0 && value < 100000);
+
+      if (!priceValues.length) {
+        return this.getEmptyPriceData({
+          source: 'ebay',
+          matchQuality: combinedQuality,
+          matchDescription: filterResult.details || 'No price data extracted from matching listings.',
+          mismatchWarning: 'Matching listings were found, but no prices were available.'
+        });
+      }
+
+      const uniquePrices = [...new Set(priceValues)];
+      const range = this.calculateIqrRange(uniquePrices);
+      const pricesForStats = range.filtered.length ? range.filtered : uniquePrices;
+
+      const buyNowCount = filteredComparables.filter(item => item?.listingFormat && item.listingFormat !== 'auction').length;
+      const auctionCount = filteredComparables.filter(item => item?.listingFormat === 'auction').length;
+      const unknownCount = filteredComparables.length - buyNowCount - auctionCount;
+
       return {
-        prices,
-        median: this.calculateMedian(prices),
+        prices: pricesForStats,
+        median: this.calculateMedian(pricesForStats),
         min: range.min,
         max: range.max,
-        compCount: comparables.length,
+        compCount: filteredComparables.length,
         currentPrice: null,
         source: 'ebay',
-        comparables,
+        comparables: filteredComparables,
         formatBreakdown: {
-          buyItNow: 0,
-          auction: 0,
-          unknown: comparables.length
+          buyItNow: buyNowCount,
+          auction: auctionCount,
+          unknown: unknownCount
         },
-        usedAuctionPrices: false
+        usedAuctionPrices: buyNowCount === 0 && auctionCount > 0,
+        matchQuality: combinedQuality,
+        matchDescription:
+          filterResult.details || options.fallbackReason || 'Comparable listings sourced via DuckDuckGo.',
+        mismatchWarning:
+          combinedQuality === 'weak'
+            ? 'Only approximate comparables were found; treat these prices cautiously.'
+            : null
       };
     } catch (error) {
       console.error('[eBay DDG Fallback] Error:', error);
-      return this.getEmptyPriceData();
+      return this.getEmptyPriceData({
+        source: 'ebay',
+        matchQuality: options.matchQuality || 'none',
+        matchDescription: 'DuckDuckGo fallback failed.',
+        mismatchWarning: 'Unable to retrieve eBay comparables at this time.'
+      });
     }
   }
 
@@ -291,7 +446,7 @@ export class PriceComparison {
   /**
    * Extract prices from a list of URLs
    */
-  static async extractPricesFromUrls(urls, site) {
+  static async extractPricesFromUrls(urls, site, productData) {
     const priceValues = [];
     const comparables = [];
 
@@ -525,7 +680,7 @@ export class PriceComparison {
   /**
    * Search eBay sold listings
    */
-  static async searchEbaySoldListings(query) {
+  static async searchEbaySoldListings(query, productData) {
     try {
       // Use DuckDuckGo to find sold listings
       const encodedQuery = encodeURIComponent(`${query} sold site:ebay.com`);
@@ -546,15 +701,21 @@ export class PriceComparison {
       const urls = this.extractUrlsFromDDG(html, 'ebay.com');
 
       // Extract prices from URLs
-      const { prices, comparables } = await this.extractPricesFromUrls(urls, 'ebay.com');
+      const { prices, comparables } = await this.extractPricesFromUrls(urls, 'ebay.com', productData);
+
+      const filterResult = this.filterComparablesByIdentity(comparables, productData);
+      const filteredComparables = filterResult.filtered.length ? filterResult.filtered : comparables;
+      const priceValues = filteredComparables
+        .map(item => item.priceValue || item.price)
+        .filter(value => typeof value === 'number' && value > 0 && value < 100000);
 
       return {
-        prices,
-        avgPrice: prices.length > 0 ? this.calculateAverage(prices) : null,
-        median: this.calculateMedian(prices),
-        count: prices.length,
+        prices: priceValues,
+        avgPrice: priceValues.length > 0 ? this.calculateAverage(priceValues) : null,
+        median: this.calculateMedian(priceValues),
+        count: priceValues.length,
         source: 'ebay_sold',
-        comparables
+        comparables: filteredComparables
       };
     } catch (error) {
       console.error('Error searching eBay sold listings:', error);
@@ -906,7 +1067,7 @@ export class PriceComparison {
   /**
    * Get empty price data structure
    */
-  static getEmptyPriceData() {
+  static getEmptyPriceData(extra = {}) {
     return {
       prices: [],
       median: null,
@@ -914,14 +1075,185 @@ export class PriceComparison {
       max: null,
       compCount: 0,
       currentPrice: null,
-      source: null,
+      source: extra.source || null,
       comparables: [],
       formatBreakdown: {
         buyItNow: 0,
         auction: 0,
         unknown: 0
       },
-      usedAuctionPrices: false
+      usedAuctionPrices: false,
+      matchQuality: extra.matchQuality || 'none',
+      matchDescription: extra.matchDescription || null,
+      mismatchWarning: extra.mismatchWarning || null
+    };
+  }
+
+  static collectProductIdentifiers(productData) {
+    const identifiers = new Set();
+    const addValue = (value) => {
+      if (!value) return;
+      if (Array.isArray(value)) {
+        value.forEach(addValue);
+        return;
+      }
+      const fragments = value.toString().split(/[\s,\/|]+/);
+      fragments.forEach((fragment) => {
+        const normalized = fragment.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+        if (!normalized) return;
+        if (normalized.length < 6) return;
+        identifiers.add(normalized);
+      });
+    };
+
+    if (!productData || typeof productData !== 'object') {
+      return identifiers;
+    }
+
+    addValue(productData.asin);
+
+    if (productData.identifiers && typeof productData.identifiers === 'object') {
+      Object.values(productData.identifiers).forEach(addValue);
+    }
+
+    const specificsSources = [
+      productData.specs,
+      productData.itemSpecifics,
+      productData.attributes
+    ].filter(Boolean);
+
+    specificsSources.forEach((obj) => {
+      if (!obj || typeof obj !== 'object') return;
+      Object.entries(obj).forEach(([key, value]) => {
+        const normalizedKey = key.toString().toLowerCase();
+        if (/(isbn|asin|upc|ean|gtin|sku|mpn|model)/.test(normalizedKey)) {
+          addValue(value);
+        }
+      });
+    });
+
+    return identifiers;
+  }
+
+  static comparableContainsIdentifier(entry, identifiers) {
+    if (!identifiers || identifiers.size === 0 || !entry) return false;
+    const haystack = [
+      entry.title,
+      entry.url,
+      entry.description
+    ]
+      .filter(Boolean)
+      .map((str) => str.toString().toUpperCase());
+
+    for (const identifier of identifiers) {
+      if (!identifier) continue;
+      if (haystack.some((segment) => segment.includes(identifier))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static tokenizeTitleForMatch(title) {
+    if (!title || typeof title !== 'string') return [];
+    return title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(' ')
+      .map((token) => token.trim())
+      .filter((token) => token.length >= 3 && !TITLE_STOP_WORDS.has(token));
+  }
+
+  static calculateTitleSimilarity(targetTokens, candidateTokens) {
+    if (!targetTokens.length || !candidateTokens.length) {
+      return 0;
+    }
+
+    const targetSet = new Set(targetTokens);
+    const candidateSet = new Set(candidateTokens);
+    let intersection = 0;
+
+    candidateSet.forEach((token) => {
+      if (targetSet.has(token)) {
+        intersection += 1;
+      }
+    });
+
+    const union = new Set([...targetSet, ...candidateSet]).size;
+    if (union === 0) return 0;
+    return intersection / union;
+  }
+
+  static filterComparablesByIdentity(comparables, productData) {
+    if (!Array.isArray(comparables) || comparables.length === 0) {
+      return { filtered: [], quality: 'none', details: 'No comparable listings to evaluate.' };
+    }
+
+    const identifiers = this.collectProductIdentifiers(productData);
+    const withMetadata = comparables.map((entry) => ({
+      entry,
+      hasIdentifier: identifiers.size ? this.comparableContainsIdentifier(entry, identifiers) : false,
+      tokens: this.tokenizeTitleForMatch(entry.title || '')
+    }));
+
+    if (identifiers.size) {
+      const matches = withMetadata.filter((item) => item.hasIdentifier);
+      if (matches.length) {
+        return {
+          filtered: matches.map((item) => item.entry),
+          quality: 'identifier',
+          details: `Matched ${matches.length} listings using identifier(s): ${Array.from(identifiers).slice(0, 4).join(', ')}`
+        };
+      }
+    }
+
+    const targetTitleTokens = this.tokenizeTitleForMatch(productData?.title || '');
+    if (targetTitleTokens.length) {
+      withMetadata.forEach((item) => {
+        item.similarity = this.calculateTitleSimilarity(targetTitleTokens, item.tokens);
+      });
+
+      withMetadata.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
+      const bestScore = withMetadata[0]?.similarity || 0;
+
+      const strongThreshold = bestScore >= 0.75 ? 0.6 : 0.45;
+      const strongMatches = withMetadata.filter((item) => (item.similarity || 0) >= strongThreshold);
+
+      if (strongMatches.length) {
+        return {
+          filtered: strongMatches.slice(0, 6).map((item) => item.entry),
+          quality: bestScore >= 0.75 ? 'title_strong' : 'title',
+          details: `Matched by title similarity (best ${(bestScore * 100).toFixed(0)}% overlap).`
+        };
+      }
+
+      const weakMatches = withMetadata.filter((item) => (item.similarity || 0) >= 0.25);
+      if (weakMatches.length) {
+        return {
+          filtered: weakMatches.slice(0, 4).map((item) => item.entry),
+          quality: 'weak',
+          details: 'Only loosely matching titles found; prices may be approximate.'
+        };
+      }
+    }
+
+    const fallbackComparables = withMetadata
+      .sort((a, b) => (b.similarity || 0) - (a.similarity || 0))
+      .slice(0, Math.min(4, withMetadata.length))
+      .map((item) => item.entry);
+
+    if (fallbackComparables.length) {
+      return {
+        filtered: fallbackComparables,
+        quality: 'fallback',
+        details: 'No identifier or strong title overlap; using closest search results as fallback.'
+      };
+    }
+
+    return {
+      filtered: [],
+      quality: 'none',
+      details: 'No comparable listings matched this product by identifier or title.'
     };
   }
 }
