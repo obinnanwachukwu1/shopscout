@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ShopScout Chat</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: #f9fafb;
+      color: #111827;
+      font-size: 14px;
+      line-height: 1.5;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .chat-header {
+      background: white;
+      border-bottom: 2px solid #e5e7eb;
+      padding: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .chat-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 18px;
+      font-weight: 700;
+      color: #1f2937;
+    }
+
+    .chat-icon {
+      font-size: 24px;
+    }
+
+    .product-badge {
+      font-size: 12px;
+      color: #6b7280;
+      background: #f3f4f6;
+      padding: 4px 8px;
+      border-radius: 4px;
+      max-width: 200px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .message {
+      display: flex;
+      gap: 12px;
+      max-width: 85%;
+      animation: fadeIn 0.3s ease-in;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .message.user {
+      align-self: flex-end;
+      flex-direction: row-reverse;
+    }
+
+    .message-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      flex-shrink: 0;
+    }
+
+    .message.user .message-avatar {
+      background: #3b82f6;
+      color: white;
+    }
+
+    .message.assistant .message-avatar {
+      background: #10b981;
+      color: white;
+    }
+
+    .message-content {
+      background: white;
+      border-radius: 12px;
+      padding: 12px 16px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+      word-wrap: break-word;
+    }
+
+    .message.user .message-content {
+      background: #3b82f6;
+      color: white;
+    }
+
+    .message-source {
+      margin-top: 8px;
+      font-size: 11px;
+      opacity: 0.7;
+      cursor: pointer;
+      text-decoration: underline;
+    }
+
+    .message-source:hover {
+      opacity: 1;
+    }
+
+    .typing-indicator {
+      display: none;
+      align-items: center;
+      gap: 12px;
+      padding: 12px;
+    }
+
+    .typing-indicator.active {
+      display: flex;
+    }
+
+    .typing-dots {
+      display: flex;
+      gap: 4px;
+      padding: 12px 16px;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    }
+
+    .typing-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #9ca3af;
+      animation: typing 1.4s infinite;
+    }
+
+    .typing-dot:nth-child(2) {
+      animation-delay: 0.2s;
+    }
+
+    .typing-dot:nth-child(3) {
+      animation-delay: 0.4s;
+    }
+
+    @keyframes typing {
+      0%, 60%, 100% { transform: translateY(0); }
+      30% { transform: translateY(-10px); }
+    }
+
+    .chat-input-container {
+      background: white;
+      border-top: 1px solid #e5e7eb;
+      padding: 16px;
+    }
+
+    .chat-input-wrapper {
+      display: flex;
+      gap: 8px;
+      align-items: flex-end;
+    }
+
+    .chat-input {
+      flex: 1;
+      padding: 12px 16px;
+      border: 1px solid #d1d5db;
+      border-radius: 24px;
+      font-size: 14px;
+      font-family: inherit;
+      resize: none;
+      max-height: 120px;
+      min-height: 44px;
+    }
+
+    .chat-input:focus {
+      outline: none;
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+    }
+
+    .send-btn {
+      background: #3b82f6;
+      color: white;
+      border: none;
+      border-radius: 50%;
+      width: 44px;
+      height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 18px;
+      transition: all 0.2s;
+      flex-shrink: 0;
+    }
+
+    .send-btn:hover {
+      background: #2563eb;
+      transform: scale(1.05);
+    }
+
+    .send-btn:disabled {
+      background: #9ca3af;
+      cursor: not-allowed;
+      transform: scale(1);
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #6b7280;
+    }
+
+    .empty-icon {
+      font-size: 64px;
+      margin-bottom: 16px;
+      opacity: 0.5;
+    }
+
+    .empty-title {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: #374151;
+    }
+
+    .empty-message {
+      font-size: 14px;
+      line-height: 1.6;
+      margin-bottom: 16px;
+    }
+
+    .suggested-questions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-width: 400px;
+      margin: 0 auto;
+    }
+
+    .suggested-question {
+      background: white;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 12px 16px;
+      cursor: pointer;
+      transition: all 0.2s;
+      text-align: left;
+      font-size: 13px;
+    }
+
+    .suggested-question:hover {
+      background: #f9fafb;
+      border-color: #3b82f6;
+      transform: translateX(4px);
+    }
+  </style>
+</head>
+<body>
+  <div class="chat-header">
+    <div class="chat-title">
+      <span class="chat-icon">💬</span>
+      <span>Ask Questions</span>
+    </div>
+    <div class="product-badge" id="productBadge">No product selected</div>
+  </div>
+
+  <div class="chat-messages" id="chatMessages">
+    <div class="empty-state" id="emptyState">
+      <div class="empty-icon">🤔</div>
+      <div class="empty-title">Ask me anything about this product</div>
+      <div class="empty-message">
+        I can answer questions about specifications, reviews, pricing, and more based on the product data.
+      </div>
+      <div class="suggested-questions" id="suggestedQuestions">
+        <button class="suggested-question">What are the main complaints in the reviews?</button>
+        <button class="suggested-question">Is this a good value for the price?</button>
+        <button class="suggested-question">What are the product dimensions?</button>
+        <button class="suggested-question">Does this work with...?</button>
+      </div>
+    </div>
+
+    <div class="typing-indicator" id="typingIndicator">
+      <div class="message-avatar" style="background: #10b981; color: white;">🔍</div>
+      <div class="typing-dots">
+        <div class="typing-dot"></div>
+        <div class="typing-dot"></div>
+        <div class="typing-dot"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="chat-input-container">
+    <div class="chat-input-wrapper">
+      <textarea
+        class="chat-input"
+        id="chatInput"
+        placeholder="Ask a question about this product..."
+        rows="1"
+      ></textarea>
+      <button class="send-btn" id="sendBtn">
+        ➤
+      </button>
+    </div>
+  </div>
+
+  <script src="chat.js" type="module"></script>
+</body>
+</html>
