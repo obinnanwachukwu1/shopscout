@@ -69,10 +69,14 @@ export class CategoryDetector {
 
     const categoryMatches = [
       'clothing', 'apparel', 'fashion', 'shoes',
-      'accessories', 'jewelry', 'watches', 'handbags'
+      'jewelry', 'watches', 'handbags', 'wear',
+      'lingerie'
     ];
 
-    return this.hasKeywords(text, keywords) || this.hasCategory(categories, categoryMatches);
+    const hasFashionKeyword = this.hasKeywords(text, keywords);
+    const hasFashionCategory = this.hasCategory(categories, categoryMatches);
+
+    return hasFashionKeyword || hasFashionCategory;
   }
 
   /**
@@ -105,13 +109,17 @@ export class CategoryDetector {
       'television', 'camera', 'drone', 'smartwatch', 'console',
       'playstation', 'xbox', 'nintendo', 'router', 'modem',
       'keyboard', 'mouse', 'hard drive', 'ssd', 'ram',
-      'processor', 'gpu', 'graphics card', 'motherboard'
+      'processor', 'gpu', 'graphics card', 'motherboard',
+      'vacuum', 'robot vacuum', 'roomba', 'mop robot',
+      'air purifier', 'smart home', 'lidar', 'floor care',
+      'cleaning robot'
     ];
 
     const categoryMatches = [
       'electronics', 'computers', 'tablets', 'cell phones',
       'accessories', 'tv & video', 'cameras', 'audio',
-      'video games', 'wearable technology', 'smart home'
+      'video games', 'wearable technology', 'smart home',
+      'robot vacuums', 'vacuums & floor care', 'appliances'
     ];
 
     return this.hasKeywords(text, keywords) || this.hasCategory(categories, categoryMatches);
@@ -121,7 +129,13 @@ export class CategoryDetector {
    * Helper: Check if text contains any keywords
    */
   static hasKeywords(text, keywords) {
-    return keywords.some(keyword => text.includes(keyword));
+    return keywords.some(keyword => {
+      const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern = keyword.includes(' ')
+        ? new RegExp(`\\b${escaped}\\b`, 'i')
+        : new RegExp(`\\b${escaped}\\b`, 'i');
+      return pattern.test(text);
+    });
   }
 
   /**

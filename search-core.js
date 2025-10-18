@@ -1,4 +1,6 @@
 import http from 'http';
+import os from 'os';
+import { Worker } from 'node:worker_threads';
 import { URL } from 'url';
 
 const DEFAULT_PORT = 9000;
@@ -8,16 +10,14 @@ const FETCH_TIMEOUT_MS = Number(process.env.SHOPSCOUT_SEARCH_CORE_TIMEOUT_MS || 
 const PLAYWRIGHT_TIMEOUT_MS = Number(process.env.SHOPSCOUT_SEARCH_CORE_PLAYWRIGHT_TIMEOUT_MS || 15000);
 const PLAYWRIGHT_NETWORK_IDLE_WAIT_MS = Number(process.env.SHOPSCOUT_SEARCH_CORE_PLAYWRIGHT_NETWORK_IDLE_MS || 2000);
 const PLAYWRIGHT_ENABLED = process.env.SHOPSCOUT_SEARCH_CORE_PLAYWRIGHT === 'false' ? false : true;
+const WORKER_COUNT = Number(process.env.SHOPSCOUT_SEARCH_CORE_WORKERS || Math.max(1, Math.min(os.cpus().length, 4)));
+const WORKER_PATH = new URL('./search-core-worker.js', import.meta.url);
 
 const defaultResponseHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-
-let chromiumModule = null;
-let playwrightBrowser = null;
-let playwrightStatus = 'unknown';
 
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, {
@@ -33,134 +33,208 @@ function applyDefaultHeaders(res) {
   });
 }
 
-async function ensurePlaywrightBrowser() {
-  if (!PLAYWRIGHT_ENABLED) {
-    return null;
-  }
+class WorkerPool {
+  constructor(workerPath, size) {
+    this.workerPath = workerPath;
+    this.size = Math.max(1, size);
+    this.queue = [];
+    this.idleWorkers = [];
+    this.workers = new Set();
+    this.tasks = new Map();
+    this.nextTaskId = 1;
+    this.shuttingDown = false;
 
-  if (playwrightStatus === 'unavailable') {
-    return null;
-  }
-
-  if (!chromiumModule) {
-    try {
-      ({ chromium: chromiumModule } = await import('playwright'));
-      playwrightStatus = 'available';
-    } catch (error) {
-      console.warn('[SearchCore] Playwright import failed. Falling back to fetch:', error.message);
-      playwrightStatus = 'unavailable';
-      return null;
+    for (let i = 0; i < this.size; i += 1) {
+      this.spawnWorker();
     }
   }
 
-  if (!playwrightBrowser) {
-    try {
-      playwrightBrowser = await chromiumModule.launch({
-        headless: true,
-        args: [
-          '--disable-gpu',
-          '--no-sandbox',
-          '--disable-setuid-sandbox'
-        ]
-      });
-      playwrightBrowser.on('disconnected', () => {
-        playwrightBrowser = null;
-      });
-    } catch (error) {
-      console.warn('[SearchCore] Playwright launch failed. Falling back to fetch:', error.message);
-      playwrightStatus = 'unavailable';
-      playwrightBrowser = null;
-      return null;
+  spawnWorker() {
+    if (this.shuttingDown) {
+      return;
     }
+
+    const worker = new Worker(this.workerPath, { type: 'module' });
+    worker.on('message', (message) => this.handleMessage(worker, message));
+    worker.on('error', (error) => this.handleWorkerError(worker, error));
+    worker.on('exit', (code) => this.handleWorkerExit(worker, code));
+
+    this.workers.add(worker);
+    this.idleWorkers.push(worker);
+    this.drainQueue();
   }
 
-  return playwrightBrowser;
-}
+  runTask(payload) {
+    if (this.shuttingDown) {
+      return Promise.reject(new Error('Worker pool is shutting down'));
+    }
 
-async function fetchWithPlaywright(targetUrl) {
-  const browser = await ensurePlaywrightBrowser();
-  if (!browser) {
-    return null;
-  }
-
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    locale: 'en-US',
-    viewport: { width: 1280, height: 720 }
-  });
-
-  const page = await context.newPage();
-  let response;
-
-  try {
-    response = await page.goto(targetUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: PLAYWRIGHT_TIMEOUT_MS
+    return new Promise((resolve, reject) => {
+      this.queue.push({ payload, resolve, reject });
+      this.drainQueue();
     });
+  }
 
-    try {
-      await page.waitForLoadState('networkidle', { timeout: PLAYWRIGHT_NETWORK_IDLE_WAIT_MS });
-    } catch (_) {
-      // networkidle timing out is acceptable for pages with continuous polling
+  drainQueue() {
+    if (this.shuttingDown) {
+      return;
     }
 
-    const html = await page.content();
+    while (this.idleWorkers.length > 0 && this.queue.length > 0) {
+      const worker = this.idleWorkers.shift();
+      const task = this.queue.shift();
+      const id = this.nextTaskId++;
 
-    return {
-      status: response?.status() ?? 200,
-      statusText: response?.statusText() ?? 'OK',
-      contentType: response?.headers()['content-type'] || 'text/html; charset=utf-8',
-      body: Buffer.from(html)
-    };
-  } catch (error) {
-    console.warn('[SearchCore] Playwright fetch error. Falling back to fetch:', error.message);
-    return null;
-  } finally {
-    await context.close();
-  }
-}
+      this.tasks.set(id, { resolve: task.resolve, reject: task.reject, worker });
 
-async function fetchWithNode(targetUrl) {
-  if (typeof fetch !== 'function') {
-    throw new Error('Global fetch is not available in this Node runtime.');
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-  try {
-    const response = await fetch(targetUrl, {
-      redirect: 'follow',
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'ShopScoutSearchCore/1.0 (+https://github.com/)',
-        'Accept-Language': 'en-US,en;q=0.9'
+      try {
+        worker.postMessage({ id, payload: task.payload });
+      } catch (error) {
+        this.tasks.delete(id);
+        task.reject(error);
+        this.handleWorkerError(worker, error);
       }
-    });
-
-    return {
-      status: response.status,
-      statusText: response.statusText,
-      contentType: response.headers.get('content-type') || 'text/html; charset=utf-8',
-      body: Buffer.from(await response.arrayBuffer())
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function forwardRequest(targetUrl, renderMode) {
-  const preferBrowser = renderMode === 'browser' || (renderMode !== 'fetch' && PLAYWRIGHT_ENABLED);
-
-  if (preferBrowser) {
-    const browserResult = await fetchWithPlaywright(targetUrl);
-    if (browserResult) {
-      return browserResult;
     }
   }
 
-  return fetchWithNode(targetUrl);
+  handleMessage(worker, message) {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    if (message && message.command === 'ready') {
+      if (!this.idleWorkers.includes(worker)) {
+        this.idleWorkers.push(worker);
+      }
+      this.drainQueue();
+      return;
+    }
+
+    const { id, success, result, error } = message || {};
+    if (typeof id !== 'number') {
+      if (!this.idleWorkers.includes(worker)) {
+        this.idleWorkers.push(worker);
+      }
+      this.drainQueue();
+      return;
+    }
+
+    const task = this.tasks.get(id);
+    if (!task) {
+      if (!this.idleWorkers.includes(worker)) {
+        this.idleWorkers.push(worker);
+      }
+      this.drainQueue();
+      return;
+    }
+
+    this.tasks.delete(id);
+
+    if (success) {
+      task.resolve(result);
+    } else {
+      task.reject(new Error(error || 'Worker task failed'));
+    }
+
+    if (!this.idleWorkers.includes(worker)) {
+      this.idleWorkers.push(worker);
+    }
+    this.drainQueue();
+  }
+
+  handleWorkerError(worker, error) {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    for (const [taskId, task] of this.tasks.entries()) {
+      if (task.worker === worker) {
+        task.reject(error);
+        this.tasks.delete(taskId);
+      }
+    }
+
+    const idleIndex = this.idleWorkers.indexOf(worker);
+    if (idleIndex !== -1) {
+      this.idleWorkers.splice(idleIndex, 1);
+    }
+
+    this.workers.delete(worker);
+
+    if (!this.shuttingDown) {
+      this.spawnWorker();
+    }
+  }
+
+  handleWorkerExit(worker, code) {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    const error = new Error(`Worker exited with code ${code}`);
+    this.handleWorkerError(worker, error);
+  }
+
+  async destroy() {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    this.shuttingDown = true;
+
+    const shutdownError = new Error('Worker pool shutting down');
+    for (const queuedTask of this.queue.splice(0)) {
+      queuedTask.reject(shutdownError);
+    }
+
+    for (const [taskId, task] of this.tasks.entries()) {
+      task.reject(shutdownError);
+      this.tasks.delete(taskId);
+    }
+
+    const workers = Array.from(this.workers);
+    await Promise.allSettled(workers.map((worker) => {
+      try {
+        worker.postMessage({ command: 'shutdown' });
+      } catch (_) {
+        // ignore
+      }
+      return worker.terminate().catch(() => {});
+    }));
+
+    this.workers.clear();
+    this.idleWorkers = [];
+  }
+
+  forceTerminate() {
+    if (this.shuttingDown) {
+      return;
+    }
+    this.shuttingDown = true;
+
+    const shutdownError = new Error('Worker pool shutting down');
+    for (const task of this.queue.splice(0)) {
+      task.reject(shutdownError);
+    }
+    for (const [taskId, task] of this.tasks.entries()) {
+      task.reject(shutdownError);
+      this.tasks.delete(taskId);
+    }
+
+    for (const worker of this.workers) {
+      try {
+        worker.terminate();
+      } catch (_) {
+        // ignore
+      }
+    }
+
+    this.workers.clear();
+    this.idleWorkers = [];
+  }
 }
+
+const workerPool = new WorkerPool(WORKER_PATH, WORKER_COUNT);
 
 const server = http.createServer(async (req, res) => {
   applyDefaultHeaders(res);
@@ -216,7 +290,17 @@ const server = http.createServer(async (req, res) => {
   const renderMode = requestUrl.searchParams.get('render');
 
   try {
-    const upstream = await forwardRequest(upstreamUrl.toString(), renderMode);
+    const upstream = await workerPool.runTask({
+      type: 'forwardRequest',
+      targetUrl: upstreamUrl.toString(),
+      renderMode
+    });
+
+    const bodyBuffer = upstream?.body
+      ? Buffer.isBuffer(upstream.body)
+        ? upstream.body
+        : Buffer.from(upstream.body)
+      : Buffer.alloc(0);
 
     res.writeHead(
       upstream.status,
@@ -226,7 +310,7 @@ const server = http.createServer(async (req, res) => {
         'Cache-Control': 'no-store'
       }
     );
-    res.end(upstream.body);
+    res.end(bodyBuffer);
   } catch (error) {
     if (error.name === 'AbortError') {
       sendJson(res, 504, { error: `Upstream request timed out after ${FETCH_TIMEOUT_MS}ms.` });
@@ -245,21 +329,22 @@ server.on('error', error => {
   process.exitCode = 1;
 });
 
-async function closePlaywrightBrowser() {
-  if (playwrightBrowser) {
-    const browser = playwrightBrowser;
-    playwrightBrowser = null;
-    try {
-      await browser.close();
-    } catch (error) {
-      console.warn('[SearchCore] Error closing Playwright browser:', error.message);
-    }
-  }
-}
+let shutdownInitiated = false;
 
 const shutdown = (signal) => {
-  closePlaywrightBrowser()
-    .catch(() => {})
+  if (shutdownInitiated) {
+    if (signal) {
+      process.exit(0);
+    }
+    return;
+  }
+
+  shutdownInitiated = true;
+
+  workerPool.destroy()
+    .catch((error) => {
+      console.warn('[ShopScout Search Core] Worker pool shutdown error:', error?.message || error);
+    })
     .finally(() => {
       if (signal) {
         process.exit(0);
@@ -270,7 +355,5 @@ const shutdown = (signal) => {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.on('exit', () => {
-  if (playwrightBrowser) {
-    playwrightBrowser.close().catch(() => {});
-  }
+  workerPool.forceTerminate();
 });

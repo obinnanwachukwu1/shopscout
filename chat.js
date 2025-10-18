@@ -6,6 +6,7 @@
 
 let currentProduct = null;
 let chatHistory = [];
+let currentAnalysis = null;
 
 // DOM elements
 const chatMessages = document.getElementById('chatMessages');
@@ -52,7 +53,8 @@ function setupEventListeners() {
   // Listen for updates from background
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type === 'ANALYSIS_UPDATED') {
-      currentProduct = message.data?.productData;
+      currentAnalysis = message.data || null;
+      currentProduct = message.data?.rawProductData || message.data?.productData || null;
       updateProductBadge();
     }
   });
@@ -68,7 +70,8 @@ async function loadCurrentProduct() {
     });
 
     if (response.success && response.data) {
-      currentProduct = response.data.productData;
+      currentAnalysis = response.data;
+      currentProduct = response.data.rawProductData || response.data.productData;
       updateProductBadge();
     }
   } catch (error) {
@@ -111,10 +114,26 @@ async function handleSendMessage() {
   typingIndicator.classList.add('active');
 
   try {
+    const contextPayload = {
+      productData: currentProduct,
+      rawProductData: currentProduct
+    };
+
+    if (currentAnalysis) {
+      contextPayload.analysis = {
+        rawProductData: currentAnalysis.rawProductData || currentProduct,
+        externalReviews: currentAnalysis.externalReviews || null
+      };
+
+      if (currentAnalysis.externalReviews) {
+        contextPayload.externalReviews = currentAnalysis.externalReviews;
+      }
+    }
+
     const response = await chrome.runtime.sendMessage({
       type: 'USER_QUESTION',
       question: message,
-      context: { productData: currentProduct }
+      context: contextPayload
     });
 
     if (response.success && response.data) {

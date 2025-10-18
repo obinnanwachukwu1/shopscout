@@ -115,10 +115,14 @@ const extractSeller = () => {
 
 const cleanCondition = (text) => {
   if (!text) return null;
+  // Keep the full condition text, just clean up the extra UI text
+  // IMPORTANT: Preserve "For parts or not working" text for DealSense detection
   return clean(
     text
-      .replace(/Read moreabout.*$/i, '')
-      .replace(/See all condition definitions.*$/i, '')
+      .replace(/Read\s+more\s*about\s+the\s+condition/gi, '')
+      .replace(/Read\s+less\s*about\s+the\s+condition/gi, '')
+      .replace(/See\s+all\s+condition\s+definitions.*$/gi, '')
+      .replace(/opens\s+in\s+a\s+new\s+window\s+or\s+tab/gi, '')
   );
 };
 
@@ -175,7 +179,7 @@ const buildItemSpecifics = (labelMap) => {
     'Returns:',
     'Payments',
     'Payments:',
-    'Condition',
+    // REMOVED 'Condition' from excluded - we need it for DealSense red flag detection
   ]);
   labelMap.forEach((value, key) => {
     if (excluded.has(key)) return;

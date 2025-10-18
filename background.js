@@ -16,6 +16,7 @@ import { BuyScoreCalculator } from './src/modules/buy-score-calculator.js';
 import { PriceComparison } from './src/modules/price-comparison.js';
 import { StopConditionChecker } from './src/modules/stop-condition-checker.js';
 import { WebSearch } from './src/modules/web-search.js';
+import { DealSense } from './src/modules/dealsense.js';
 
 // Global state
 let currentAnalysis = null;
@@ -27,6 +28,27 @@ const EXTERNAL_REVIEW_TTL = 15 * 60 * 1000;
 
 const externalReviewCache = new Map();
 const externalReviewPending = new Map();
+
+function cloneProductData(productData) {
+  if (productData == null) {
+    return productData;
+  }
+
+  if (typeof structuredClone === 'function') {
+    try {
+      return structuredClone(productData);
+    } catch (error) {
+      console.warn('[Background] structuredClone failed, falling back to JSON clone:', error);
+    }
+  }
+
+  try {
+    return JSON.parse(JSON.stringify(productData));
+  } catch (error) {
+    console.error('[Background] Failed to clone product data:', error);
+    return productData;
+  }
+}
 
 function normalizeSpecAnalysis(raw, defaultConfidence = 0.6) {
   if (!raw || typeof raw !== 'object') {
@@ -141,6 +163,8 @@ async function fetchExternalReviewIntel(productData) {
 }
 
 async function performAnalysis(productData, cacheKey) {
+  const productSnapshot = cloneProductData(productData);
+
   // Step 1: Check stop conditions
   const stopCondition = StopConditionChecker.check(productData);
   if (stopCondition.shouldStop) {
@@ -148,7 +172,8 @@ async function performAnalysis(productData, cacheKey) {
       status: 'stopped',
       reason: stopCondition.reason,
       message: stopCondition.message,
-      productData
+      productData: productSnapshot,
+      rawProductData: productSnapshot
     };
 
     analysisCache.set(cacheKey, {
@@ -165,6 +190,8 @@ async function performAnalysis(productData, cacheKey) {
 
   // Step 3: Run analysis based on mode
   const analysisResult = await runAnalysisByMode(productData, category);
+  analysisResult.productData = productSnapshot;
+  analysisResult.rawProductData = productSnapshot;
 
   analysisCache.set(cacheKey, {
     data: analysisResult,
@@ -312,38 +339,42 @@ async function runAnalysisByMode(productData, category) {
 async function runElectronicsMode(result, productData) {
   console.log('Running Electronics Mode');
 
-  const [priceData, externalReviews] = await Promise.all([
-    PriceComparison.fetchComparables(productData),
-    fetchExternalReviewIntel(productData)
-  ]);
+  // Fetch price data only - removed external review search and spec analysis for speed
+  const priceData = await PriceComparison.fetchComparables(productData);
 
   const bundle = await ClaudeAPI.analyzeProductBundle(productData, 'ELECTRONICS', {
-    externalInsights: externalReviews
+    externalInsights: null
   });
 
-  const specAnalysis = normalizeSpecAnalysis(bundle?.specAnalysis, bundle?.confidence || 0.6);
   const sentimentAnalysis = normalizeSentimentAnalysis(bundle?.sentiment, 'ELECTRONICS', bundle?.confidence || 0.6);
 
   // Add current price to priceData
   priceData.currentPrice = productData.price?.value || null;
 
-  // Calculate Buy Score
+  // Calculate Buy Score (without spec analysis)
   const buyScore = BuyScoreCalculator.calculate({
     productData,
     priceData,
-    specAnalysis,
+    specAnalysis: null,
     sentimentAnalysis
   });
+
+  // Add DealSense for eBay listings with auction/best offer
+  let dealSense = null;
+  if (productData.site === 'ebay') {
+    dealSense = DealSense.analyze(productData, priceData);
+  }
 
   return {
     ...result,
     priceData,
-    specAnalysis,
+    specAnalysis: null,
     sentimentAnalysis,
-    externalReviews,
+    externalReviews: null,
     summary: bundle?.recommendation || null,
     buyScore,
-    recommendation: generateRecommendation(buyScore)
+    recommendation: generateRecommendation(buyScore),
+    dealSense
   };
 }
 
@@ -353,13 +384,11 @@ async function runElectronicsMode(result, productData) {
 async function runFashionMode(result, productData) {
   console.log('Running Fashion Mode');
 
-  const [priceData, externalReviews] = await Promise.all([
-    PriceComparison.fetchComparables(productData),
-    fetchExternalReviewIntel(productData)
-  ]);
+  // Fetch price data only - removed external review search for speed
+  const priceData = await PriceComparison.fetchComparables(productData);
 
   const bundle = await ClaudeAPI.analyzeProductBundle(productData, 'FASHION', {
-    externalInsights: externalReviews
+    externalInsights: null
   });
 
   const fitAnalysis = normalizeSentimentAnalysis(bundle?.sentiment, 'FASHION', bundle?.confidence || 0.6);
@@ -367,17 +396,24 @@ async function runFashionMode(result, productData) {
   // Add current price to priceData
   priceData.currentPrice = productData.price?.value || null;
 
+  // Add DealSense for eBay listings with auction/best offer
+  let dealSense = null;
+  if (productData.site === 'ebay') {
+    dealSense = DealSense.analyze(productData, priceData);
+  }
+
   return {
     ...result,
     priceData,
     fitAnalysis,
-    externalReviews,
+    externalReviews: null,
     summary: bundle?.recommendation || null,
     buyScore: null, // Disabled for fashion
     verdict: {
       type: 'fit_sizing',
       data: fitAnalysis
-    }
+    },
+    dealSense
   };
 }
 
@@ -387,13 +423,11 @@ async function runFashionMode(result, productData) {
 async function runBeautyMode(result, productData) {
   console.log('Running Beauty Mode');
 
-  const [priceData, externalReviews] = await Promise.all([
-    PriceComparison.fetchComparables(productData),
-    fetchExternalReviewIntel(productData)
-  ]);
+  // Fetch price data only - removed external review search for speed
+  const priceData = await PriceComparison.fetchComparables(productData);
 
   const bundle = await ClaudeAPI.analyzeProductBundle(productData, 'BEAUTY', {
-    externalInsights: externalReviews
+    externalInsights: null
   });
 
   const beautyAnalysis = normalizeBeautyAnalysis(bundle?.beauty, bundle?.confidence || 0.5);
@@ -401,17 +435,24 @@ async function runBeautyMode(result, productData) {
   // Add current price to priceData
   priceData.currentPrice = productData.price?.value || null;
 
+  // Add DealSense for eBay listings with auction/best offer
+  let dealSense = null;
+  if (productData.site === 'ebay') {
+    dealSense = DealSense.analyze(productData, priceData);
+  }
+
   return {
     ...result,
     priceData,
     beautyAnalysis,
-    externalReviews,
+    externalReviews: null,
     summary: bundle?.recommendation || null,
     buyScore: null, // Disabled for beauty
     verdict: {
       type: 'beauty_analysis',
       data: beautyAnalysis
-    }
+    },
+    dealSense
   };
 }
 
@@ -421,28 +462,33 @@ async function runBeautyMode(result, productData) {
 async function runCollectiblesMode(result, productData) {
   console.log('Running Collectibles Mode');
 
-  const [soldComps, externalReviews] = await Promise.all([
-    PriceComparison.fetchSoldListings(productData),
-    fetchExternalReviewIntel(productData)
-  ]);
+  // Fetch sold comps only - removed external review search for speed
+  const soldComps = await PriceComparison.fetchSoldListings(productData);
 
   const bundle = await ClaudeAPI.analyzeProductBundle(productData, 'COLLECTIBLES', {
-    externalInsights: externalReviews
+    externalInsights: null
   });
 
   const sentimentAnalysis = normalizeSentimentAnalysis(bundle?.sentiment, 'COLLECTIBLES', bundle?.confidence || 0.6);
+
+  // Add DealSense for eBay listings with auction/best offer (use sold comps as price data)
+  let dealSense = null;
+  if (productData.site === 'ebay') {
+    dealSense = DealSense.analyze(productData, soldComps);
+  }
 
   return {
     ...result,
     soldComps,
     sentimentAnalysis,
-    externalReviews,
+    externalReviews: null,
     summary: bundle?.recommendation || null,
     buyScore: null, // Disabled for collectibles
     verdict: {
       type: 'sold_comps',
       data: soldComps
-    }
+    },
+    dealSense
   };
 }
 
@@ -452,16 +498,13 @@ async function runCollectiblesMode(result, productData) {
 async function runGenericMode(result, productData) {
   console.log('Running Generic Mode');
 
-  const [priceData, externalReviews] = await Promise.all([
-    PriceComparison.fetchComparables(productData),
-    fetchExternalReviewIntel(productData)
-  ]);
+  // Fetch price data only - removed external review search and spec analysis for speed
+  const priceData = await PriceComparison.fetchComparables(productData);
 
   const bundle = await ClaudeAPI.analyzeProductBundle(productData, 'GENERIC_HOME_GOODS', {
-    externalInsights: externalReviews
+    externalInsights: null
   });
 
-  const specAnalysis = normalizeSpecAnalysis(bundle?.specAnalysis, bundle?.confidence || 0.6);
   const sentimentAnalysis = normalizeSentimentAnalysis(bundle?.sentiment, 'GENERIC', bundle?.confidence || 0.6);
 
   // Add current price to priceData
@@ -474,15 +517,22 @@ async function runGenericMode(result, productData) {
     sentimentAnalysis
   });
 
+  // Add DealSense for eBay listings with auction/best offer
+  let dealSense = null;
+  if (productData.site === 'ebay') {
+    dealSense = DealSense.analyze(productData, priceData);
+  }
+
   return {
     ...result,
     priceData,
     sentimentAnalysis,
-    specAnalysis,
-    externalReviews,
+    specAnalysis: null,
+    externalReviews: null,
     summary: bundle?.recommendation || null,
     buyScore,
-    recommendation: generateRecommendation(buyScore)
+    recommendation: generateRecommendation(buyScore),
+    dealSense
   };
 }
 
@@ -492,13 +542,23 @@ async function runGenericMode(result, productData) {
 async function handleUserQuestion(question, context, sendResponse) {
   console.log('Handling user question:', question);
 
-  const productData = context?.productData || context || currentAnalysis?.productData;
+  const productData =
+    context?.productData ||
+    context?.rawProductData ||
+    context?.analysis?.rawProductData ||
+    context?.analysis?.productData ||
+    currentAnalysis?.rawProductData ||
+    currentAnalysis?.productData;
   if (!productData) {
     sendResponse({ success: false, error: 'No product context available' });
     return;
   }
 
-  const externalReviews = context?.externalReviews || currentAnalysis?.externalReviews || null;
+  const externalReviews =
+    context?.externalReviews ||
+    context?.analysis?.externalReviews ||
+    currentAnalysis?.externalReviews ||
+    null;
 
   // Use Claude to answer with RAG-style context and optional smart search
   const answer = await ClaudeAPI.answerQuestion(question, productData, externalReviews);
@@ -511,19 +571,34 @@ async function handleUserQuestion(question, context, sendResponse) {
  * Generate recommendation based on Buy Score
  */
 function generateRecommendation(buyScore) {
-  if (buyScore >= 8) {
+  const score =
+    typeof buyScore === 'number'
+      ? buyScore
+      : typeof buyScore === 'object' && buyScore !== null && typeof buyScore.total === 'number'
+        ? buyScore.total
+        : null;
+
+  if (score === null) {
+    return {
+      verdict: 'Score Unavailable',
+      color: '#6b7280',
+      message: 'Not enough data yet to generate a Buy Score verdict'
+    };
+  }
+
+  if (score >= 8) {
     return {
       verdict: 'Strong Buy',
       color: '#22c55e',
       message: 'Excellent value with strong ratings and fair price'
     };
-  } else if (buyScore >= 6) {
+  } else if (score >= 6) {
     return {
       verdict: 'Good Buy',
       color: '#3b82f6',
       message: 'Good value, minor concerns to consider'
     };
-  } else if (buyScore >= 4) {
+  } else if (score >= 4) {
     return {
       verdict: 'Proceed with Caution',
       color: '#f59e0b',

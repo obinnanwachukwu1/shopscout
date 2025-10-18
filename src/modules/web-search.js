@@ -2,6 +2,10 @@ import { ClaudeAPI } from './claude-api.js';
 
 const ANALYSIS_HTML_MAX_LENGTH = 8000;
 const LOCAL_SEARCH_PROXY_URL = 'http://127.0.0.1:9000/fetch?render=browser&url=';
+const isNodeEnvironment = typeof process !== 'undefined' && !!process.versions?.node;
+const WEB_SEARCH_WORKER_PATH = new URL('./web-search-worker.js', import.meta.url);
+let webSearchWorkerPoolPromise = null;
+let webSearchWorkerShutdownHookRegistered = false;
 
 /**
  * Web Search Module
@@ -571,6 +575,48 @@ export class WebSearch {
   }
 
   static async fetchPageHtml(url, maxChars = ANALYSIS_HTML_MAX_LENGTH) {
+    const pool = await getWebSearchWorkerPool();
+    if (pool) {
+      try {
+        const html = await pool.runTask({
+          type: 'fetchPageHtml',
+          url,
+          maxChars,
+          proxyUrl: LOCAL_SEARCH_PROXY_URL
+        });
+        if (typeof html === 'string') {
+          return html;
+        }
+      } catch (error) {
+        console.warn('[WebSearch] Worker fetchPageHtml failed:', error);
+      }
+    }
+
+    return this.fetchPageHtmlSingleThread(url, maxChars);
+  }
+
+  static async fetchPageSnippet(url) {
+    const pool = await getWebSearchWorkerPool();
+    if (pool) {
+      try {
+        const snippet = await pool.runTask({
+          type: 'fetchPageSnippet',
+          url,
+          proxyUrl: LOCAL_SEARCH_PROXY_URL,
+          maxChars: ANALYSIS_HTML_MAX_LENGTH
+        });
+        if (typeof snippet === 'string' && snippet.length) {
+          return snippet;
+        }
+      } catch (error) {
+        console.warn('[WebSearch] Worker fetchPageSnippet failed:', url, error);
+      }
+    }
+
+    return this.fetchPageSnippetSingleThread(url);
+  }
+
+  static async fetchPageHtmlSingleThread(url, maxChars = ANALYSIS_HTML_MAX_LENGTH) {
     const sources = [];
 
     if (LOCAL_SEARCH_PROXY_URL) {
@@ -578,7 +624,7 @@ export class WebSearch {
         type: 'proxy',
         url: `${LOCAL_SEARCH_PROXY_URL}${encodeURIComponent(url)}`,
         headers: {
-          'Accept': 'text/html,application/xhtml+xml'
+          Accept: 'text/html,application/xhtml+xml'
         }
       });
     }
@@ -617,9 +663,12 @@ export class WebSearch {
     return null;
   }
 
-  static async fetchPageSnippet(url) {
+  static async fetchPageSnippetSingleThread(url) {
     try {
-      const html = await this.fetchPageHtml(url);
+      const html = await this.fetchPageHtmlSingleThread(url);
+      if (!html) {
+        return null;
+      }
       const plainText = this.cleanText(this.stripHtml(html));
       if (plainText) {
         return plainText.slice(0, 12000);
@@ -629,4 +678,241 @@ export class WebSearch {
     }
     return null;
   }
+}
+
+class ThreadPool {
+  constructor(WorkerCtor, workerPath, size) {
+    this.WorkerCtor = WorkerCtor;
+    this.workerPath = workerPath;
+    this.size = Math.max(1, size);
+    this.queue = [];
+    this.idleWorkers = [];
+    this.workers = new Set();
+    this.tasks = new Map();
+    this.nextTaskId = 1;
+    this.shuttingDown = false;
+
+    for (let i = 0; i < this.size; i += 1) {
+      this.spawnWorker();
+    }
+  }
+
+  spawnWorker() {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    const worker = new this.WorkerCtor(this.workerPath, { type: 'module' });
+    worker.on('message', (message) => this.handleMessage(worker, message));
+    worker.on('error', (error) => this.handleWorkerError(worker, error));
+    worker.on('exit', (code) => this.handleWorkerExit(worker, code));
+
+    this.workers.add(worker);
+    this.idleWorkers.push(worker);
+    this.drainQueue();
+  }
+
+  runTask(payload) {
+    if (this.shuttingDown) {
+      return Promise.reject(new Error('Worker pool is shutting down'));
+    }
+
+    return new Promise((resolve, reject) => {
+      this.queue.push({ payload, resolve, reject });
+      this.drainQueue();
+    });
+  }
+
+  drainQueue() {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    while (this.idleWorkers.length > 0 && this.queue.length > 0) {
+      const worker = this.idleWorkers.shift();
+      const task = this.queue.shift();
+      const id = this.nextTaskId++;
+
+      this.tasks.set(id, { resolve: task.resolve, reject: task.reject, worker });
+
+      try {
+        worker.postMessage({ id, payload: task.payload });
+      } catch (error) {
+        this.tasks.delete(id);
+        task.reject(error);
+        this.handleWorkerError(worker, error);
+      }
+    }
+  }
+
+  handleMessage(worker, message) {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    if (message && message.command === 'ready') {
+      if (!this.idleWorkers.includes(worker)) {
+        this.idleWorkers.push(worker);
+      }
+      this.drainQueue();
+      return;
+    }
+
+    const { id, success, result, error } = message || {};
+    if (typeof id !== 'number') {
+      if (!this.idleWorkers.includes(worker)) {
+        this.idleWorkers.push(worker);
+      }
+      this.drainQueue();
+      return;
+    }
+
+    const task = this.tasks.get(id);
+    if (!task) {
+      if (!this.idleWorkers.includes(worker)) {
+        this.idleWorkers.push(worker);
+      }
+      this.drainQueue();
+      return;
+    }
+
+    this.tasks.delete(id);
+
+    if (success) {
+      task.resolve(result);
+    } else {
+      task.reject(new Error(error || 'Worker task failed'));
+    }
+
+    if (!this.idleWorkers.includes(worker)) {
+      this.idleWorkers.push(worker);
+    }
+    this.drainQueue();
+  }
+
+  handleWorkerError(worker, error) {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    for (const [taskId, task] of this.tasks.entries()) {
+      if (task.worker === worker) {
+        task.reject(error);
+        this.tasks.delete(taskId);
+      }
+    }
+
+    const idleIndex = this.idleWorkers.indexOf(worker);
+    if (idleIndex !== -1) {
+      this.idleWorkers.splice(idleIndex, 1);
+    }
+
+    this.workers.delete(worker);
+
+    if (!this.shuttingDown) {
+      this.spawnWorker();
+    }
+  }
+
+  handleWorkerExit(worker, code) {
+    if (this.shuttingDown) {
+      return;
+    }
+    const error = new Error(`Worker exited with code ${code}`);
+    this.handleWorkerError(worker, error);
+  }
+
+  async destroy() {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    this.shuttingDown = true;
+
+    const shutdownError = new Error('Worker pool shutting down');
+    for (const queuedTask of this.queue.splice(0)) {
+      queuedTask.reject(shutdownError);
+    }
+
+    for (const [taskId, task] of this.tasks.entries()) {
+      task.reject(shutdownError);
+      this.tasks.delete(taskId);
+    }
+
+    const workers = Array.from(this.workers);
+    await Promise.allSettled(workers.map((worker) => {
+      try {
+        worker.postMessage({ command: 'shutdown' });
+      } catch (_) {
+        // ignore
+      }
+      return worker.terminate().catch(() => {});
+    }));
+
+    this.workers.clear();
+    this.idleWorkers = [];
+  }
+
+  forceTerminate() {
+    if (this.shuttingDown) {
+      return;
+    }
+    this.shuttingDown = true;
+
+    const shutdownError = new Error('Worker pool shutting down');
+    for (const task of this.queue.splice(0)) {
+      task.reject(shutdownError);
+    }
+    for (const [taskId, task] of this.tasks.entries()) {
+      task.reject(shutdownError);
+      this.tasks.delete(taskId);
+    }
+
+    for (const worker of this.workers) {
+      try {
+        worker.terminate();
+      } catch (_) {
+        // ignore
+      }
+    }
+
+    this.workers.clear();
+    this.idleWorkers = [];
+  }
+}
+
+async function getWebSearchWorkerPool() {
+  if (!isNodeEnvironment) {
+    return null;
+  }
+
+  if (webSearchWorkerPoolPromise) {
+    return webSearchWorkerPoolPromise;
+  }
+
+  webSearchWorkerPoolPromise = (async () => {
+    try {
+      const { Worker } = await import('node:worker_threads');
+      const os = await import('node:os');
+      const workerCount = Number(
+        process.env.SHOPSCOUT_WEB_SEARCH_WORKERS ||
+        Math.max(1, Math.min(os.cpus().length, 4))
+      );
+      const pool = new ThreadPool(Worker, WEB_SEARCH_WORKER_PATH, workerCount);
+
+      if (!webSearchWorkerShutdownHookRegistered && typeof process !== 'undefined' && typeof process.on === 'function') {
+        webSearchWorkerShutdownHookRegistered = true;
+        process.on('exit', () => {
+          pool.forceTerminate();
+        });
+      }
+
+      return pool;
+    } catch (error) {
+      console.warn('[WebSearch] Worker threads unavailable:', error.message);
+      return null;
+    }
+  })();
+
+  return webSearchWorkerPoolPromise;
 }

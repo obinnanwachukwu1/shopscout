@@ -17,6 +17,23 @@ const clean = (value) => {
   return normalized.length ? normalized : null;
 };
 
+const getVisibleText = (node) => {
+  if (!node) return null;
+  const clone = node.cloneNode(true);
+
+  clone.querySelectorAll('script, style, noscript').forEach((el) => el.remove());
+
+  const raw = clone.textContent;
+  if (!raw) return null;
+
+  const withoutBoilerplate = raw
+    .replace(/\bRead (more|less)( of this review)?\b/gi, ' ')
+    .replace(/\bTop positive review\b/gi, ' ') // occasionally repeated header
+    .replace(/\bTop critical review\b/gi, ' ');
+
+  return clean(withoutBoilerplate) || clean(raw);
+};
+
 const textFromSelectors = (selectors) => {
   for (const selector of selectors) {
     const node = document.querySelector(selector);
@@ -334,14 +351,14 @@ const extractReviews = () => {
     const review = {
       id,
       selector: id ? `#${id}` : (card?.id ? `#${card.id}` : null),
-      title: clean(titleNode?.textContent),
-      body: clean(bodyNode?.textContent),
+      title: getVisibleText(titleNode),
+      body: getVisibleText(bodyNode),
       rating: ratingNode ? parseFloat((clean(ratingNode.textContent)?.match(/[\d.]+/) || [])[0]) || null : null,
-      date: clean(dateNode?.textContent),
-      format: clean(formatNode?.textContent),
+      date: getVisibleText(dateNode),
+      format: getVisibleText(formatNode),
       helpfulCount: extractReviewHelpfulCount(helpfulNode?.textContent || ''),
       badges,
-      author: clean(authorNode?.textContent)
+      author: getVisibleText(authorNode)
     };
 
     // Skip totally empty reviews
