@@ -560,11 +560,78 @@ async function handleUserQuestion(question, context, sendResponse) {
     currentAnalysis?.externalReviews ||
     null;
 
-  // Use Claude to answer with RAG-style context and optional smart search
-  const answer = await ClaudeAPI.answerQuestion(question, productData, externalReviews);
+  const progressHandler = (event) => {
+    if (!event || typeof event !== 'object') {
+      return;
+    }
 
-  sendResponse({ success: true, data: answer });
-  broadcastToSidepanel({ type: 'QUESTION_ANSWERED', data: answer });
+    broadcastToSidepanel({
+      type: 'CHAT_PROGRESS',
+      data: {
+        question,
+        ...event
+      }
+    });
+  };
+
+  try {
+    // Use Claude to answer with RAG-style context and optional smart search
+    const answer = await ClaudeAPI.answerQuestion(
+      question,
+      productData,
+      externalReviews,
+      {
+        onProgress: progressHandler
+      }
+    );
+
+    const streamId = generateId('answer');
+    streamAnswerToSidepanel(streamId, answer).catch((error) => {
+      console.error('[Background] Failed to stream answer:', error);
+      broadcastToSidepanel({
+        type: 'CHAT_STREAM_ERROR',
+        data: {
+          streamId,
+          message: 'Failed to stream answer. Showing complete response instead.'
+        }
+      });
+      broadcastToSidepanel({
+        type: 'QUESTION_ANSWERED',
+        data: {
+          ...answer,
+          streamed: false
+        }
+      });
+    });
+
+    sendResponse({
+      success: true,
+      data: {
+        ...answer,
+        streamed: true,
+        streamId
+      }
+    });
+
+    // Ensure other parts of the extension receive the final answer payload
+    broadcastToSidepanel({
+      type: 'QUESTION_ANSWERED',
+      data: {
+        ...answer,
+        streamed: true,
+        streamId
+      }
+    });
+  } catch (error) {
+    console.error('Error answering question:', error);
+    broadcastToSidepanel({
+      type: 'CHAT_STREAM_ERROR',
+      data: {
+        message: 'Unable to answer that question right now.'
+      }
+    });
+    sendResponse({ success: false, error: error.message });
+  }
 }
 
 /**
@@ -611,6 +678,84 @@ function generateRecommendation(buyScore) {
       message: 'Significant concerns found, consider alternatives'
     };
   }
+}
+
+
+function generateId(prefix = 'evt') {
+  if (globalThis.crypto?.randomUUID) {
+    return `${prefix}_${globalThis.crypto.randomUUID()}`;
+  }
+
+  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+async function streamAnswerToSidepanel(streamId, answerPayload) {
+  const fullAnswer = answerPayload?.answer || '';
+  const source = answerPayload?.source || null;
+  const search = answerPayload?.search || null;
+
+  broadcastToSidepanel({
+    type: 'CHAT_STREAM_START',
+    data: {
+      streamId,
+      source,
+      search
+    }
+  });
+
+  const chunks = chunkTextForStream(fullAnswer);
+
+  if (chunks.length === 0) {
+    broadcastToSidepanel({
+      type: 'CHAT_STREAM_END',
+      data: {
+        streamId,
+        fullAnswer,
+        source,
+        search
+      }
+    });
+    return;
+  }
+
+  for (const chunk of chunks) {
+    broadcastToSidepanel({
+      type: 'CHAT_STREAM_CHUNK',
+      data: {
+        streamId,
+        chunk
+      }
+    });
+    await delay(45 + Math.floor(Math.random() * 60));
+  }
+
+  broadcastToSidepanel({
+    type: 'CHAT_STREAM_END',
+    data: {
+      streamId,
+      fullAnswer,
+      source,
+      search
+    }
+  });
+}
+
+function chunkTextForStream(text, chunkSize = 55) {
+  if (!text || typeof text !== 'string') {
+    return [];
+  }
+
+  const chunks = [];
+
+  for (let i = 0; i < text.length; i += chunkSize) {
+    chunks.push(text.slice(i, i + chunkSize));
+  }
+
+  return chunks;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**

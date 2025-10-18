@@ -24,6 +24,26 @@ export class ClaudeAPI {
   static _activeRequests = 0;
   static _waitQueue = [];
 
+  static getGlobalSystemPreamble() {
+    try {
+      const now = new Date();
+      const iso = now.toISOString();
+      const local = now.toLocaleString('en-US', {
+        hour12: true,
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        timeZoneName: 'short'
+      });
+      return `Current date/time: ${local} (ISO 8601: ${iso})`;
+    } catch (error) {
+      console.warn('[Claude API] Failed to build date preamble:', error);
+      return 'Current date/time: unavailable';
+    }
+  }
+
   /**
    * Set API key programmatically
    */
@@ -47,7 +67,9 @@ export class ClaudeAPI {
       return `${index + 1}. ${rating} - ${title}${author}${date}${body}`;
     }).join('\n\n') || 'No reviews captured on the page.';
 
-    const prompt = `You are an AI product insights analyst. Perform a comprehensive assessment for the mode "${mode}" using ONLY the evidence below. Avoid speculation.
+    const prompt = `${this.getGlobalSystemPreamble()}
+
+You are an AI product insights analyst. Perform a comprehensive assessment for the mode "${mode}" using ONLY the evidence below. Avoid speculation.
 
 Product Title: ${productData.title}
 Price: ${productData.price?.formatted || 'Unknown'}
@@ -129,13 +151,23 @@ Mode-specific rules:
   /**
    * Answer user questions with grounded context (RAG-style)
    */
-  static async answerQuestion(question, productData, externalReviewInsights = null) {
+  static async answerQuestion(question, productData, externalReviewInsights = null, callbacks = {}) {
     const fallbackResponse = {
       action: 'respond',
       answer: 'I could not find that information in the provided product details.',
       source: null,
       confidence: 0.5
     };
+
+    const onProgress = typeof callbacks?.onProgress === 'function'
+      ? callbacks.onProgress
+      : null;
+
+    onProgress?.({
+      type: 'status',
+      status: 'started',
+      message: 'Analyzing question'
+    });
 
     let searchContext = null;
     let iterations = 0;
@@ -145,7 +177,9 @@ Mode-specific rules:
       const context = this.extractRelevantContext(question, productData, externalReviewInsights);
       const searchSummary = this.formatSearchResultsForPrompt(searchContext);
 
-      const prompt = `You are a grounded shopping assistant. Answer the user's question ONLY using the provided context and optional smart-search results. If information is unavailable, say so clearly.
+      const prompt = `${this.getGlobalSystemPreamble()}
+
+You are a grounded shopping assistant. Answer the user's question ONLY using the provided context and optional smart-search results. If information is unavailable, say so clearly.
 
 Product: ${productData?.title || 'Unknown Product'}
 
@@ -168,6 +202,12 @@ Always respond with strictly valid JSON.`;
       const response = await this.callClaude(prompt, SONNET_MODEL, fallbackResponse);
 
       if (!response || response.action !== 'smart_search') {
+        onProgress?.({
+          type: 'status',
+          status: 'completed',
+          message: 'Answer ready'
+        });
+
         return {
           answer: response?.answer || fallbackResponse.answer,
           source: response?.source || fallbackResponse.source,
@@ -182,14 +222,42 @@ Always respond with strictly valid JSON.`;
       }
 
       if (!response.toolRequest?.query || iterations === maxSearchIterations) {
+        onProgress?.({
+          type: 'status',
+          status: 'completed',
+          message: 'Answer ready'
+        });
         return fallbackResponse;
       }
+
+      const toolCallId = this._generateEventId('smart_search');
+      onProgress?.({
+        type: 'tool_call',
+        status: 'start',
+        toolCallId,
+        tool: 'smart_search',
+        query: response.toolRequest.query,
+        siteFilter: response.toolRequest.siteFilter || null
+      });
 
       try {
         const result = await WebSearch.smartSearch(response.toolRequest.query, {
           siteFilter: response.toolRequest.siteFilter || null,
           maxResults: 12,
           analysisResultCount: 5
+        });
+
+        onProgress?.({
+          type: 'tool_call',
+          status: 'complete',
+          toolCallId,
+          tool: 'smart_search',
+          query: response.toolRequest.query,
+          siteFilter: response.toolRequest.siteFilter || null,
+          summary: result?.analysis?.summary || null,
+          bestLinks: Array.isArray(result?.analysis?.bestLinks)
+            ? result.analysis.bestLinks.slice(0, 3)
+            : []
         });
 
         searchContext = {
@@ -202,9 +270,26 @@ Always respond with strictly valid JSON.`;
         iterations += 1;
       } catch (error) {
         console.error('[Claude API] Smart search tool failed:', error);
+
+        onProgress?.({
+          type: 'tool_call',
+          status: 'error',
+          toolCallId,
+          tool: 'smart_search',
+          query: response.toolRequest.query,
+          siteFilter: response.toolRequest.siteFilter || null,
+          error: error instanceof Error ? error.message : 'Unknown error'
+        });
+
         return fallbackResponse;
       }
     }
+
+    onProgress?.({
+      type: 'status',
+      status: 'completed',
+      message: 'Answer ready'
+    });
 
     return fallbackResponse;
   }
@@ -359,7 +444,7 @@ ${links || '- None provided'}`;
         },
         body: JSON.stringify({
           model: model,
-          max_tokens: 1024,
+          max_tokens: 3200,
           messages: [
             {
               role: 'user',
@@ -453,5 +538,14 @@ ${links || '- None provided'}`;
       next.resolve();
       break;
     }
+  }
+
+  static _generateEventId(prefix = 'evt') {
+    if (globalThis.crypto?.randomUUID) {
+      return `${prefix}_${globalThis.crypto.randomUUID()}`;
+    }
+
+    const random = Math.random().toString(16).slice(2);
+    return `${prefix}_${Date.now()}_${random}`;
   }
 }

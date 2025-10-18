@@ -1,6 +1,6 @@
 import { parentPort } from 'node:worker_threads';
 
-const DEFAULT_MAX_CHARS = 8000;
+const DEFAULT_MAX_CHARS = 60000;
 
 function cleanText(text) {
   if (!text) return '';

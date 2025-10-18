@@ -1,11 +1,29 @@
 import { ClaudeAPI } from './claude-api.js';
 
-const ANALYSIS_HTML_MAX_LENGTH = 8000;
+const ANALYSIS_HTML_MAX_LENGTH = 60000;
+const RAG_CHUNK_SIZE = 900;
+const RAG_CHUNK_OVERLAP = 150;
+const RAG_MAX_CHUNKS_PER_RESULT = 3;
+const RAG_CHUNK_PROMPT_LIMIT = 750;
+const RAG_MIN_SCORE = 0.05;
+const RAG_FALLBACK_PROMPT_LIMIT = 2000;
 const LOCAL_SEARCH_PROXY_URL = 'http://127.0.0.1:9000/fetch?render=browser&url=';
 const isNodeEnvironment = typeof process !== 'undefined' && !!process.versions?.node;
 const WEB_SEARCH_WORKER_PATH = new URL('./web-search-worker.js', import.meta.url);
 let webSearchWorkerPoolPromise = null;
 let webSearchWorkerShutdownHookRegistered = false;
+
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'this', 'that', 'from', 'into', 'your', 'about', 'near',
+  'best', 'type', 'what', 'does', 'will', 'when', 'have', 'has', 'are', 'was', 'were', 'can',
+  'where', 'which', 'does', 'its', 'than', 'also', 'more', 'info', 'information', 'overview',
+  'guide', 'latest', 'news', 'review', 'reviews'
+]);
+
+const PRICE_KEYWORDS = new Set([
+  'price', 'prices', 'pricing', 'cost', 'value', 'worth', 'sale', 'deals', 'deal',
+  'offer', 'offers', 'refurbished', 'used', 'market', 'listing', 'listings'
+]);
 
 /**
  * Web Search Module
@@ -99,7 +117,7 @@ export class WebSearch {
       };
     }
 
-    await this.populateAnalysisHtml(analyzedResults, analysisResultCount);
+    await this.populateAnalysisHtml(analyzedResults, analysisResultCount, ANALYSIS_HTML_MAX_LENGTH, query);
 
     const fallbackAnalysis = this.buildFallbackAnalysis(analyzedResults);
     const prompt = this.buildAnalysisPrompt(query, analyzedResults);
@@ -129,7 +147,9 @@ export class WebSearch {
         title: result.title,
         url: result.url,
         snippetPreview: result.snippet ? `${result.snippet.slice(0, 200)}${result.snippet.length > 200 ? '…' : ''}` : null,
-        snippetLength: result.snippet ? result.snippet.length : 0
+        snippetLength: result.snippet ? result.snippet.length : 0,
+        ragChunks: Array.isArray(result.ragChunks) ? result.ragChunks.length : 0,
+        ragTopScore: Array.isArray(result.ragChunks) && result.ragChunks[0] ? result.ragChunks[0].score : null
       }))
     });
 
@@ -292,31 +312,71 @@ export class WebSearch {
    * Build Claude prompt for analyzing search results
    */
   static buildAnalysisPrompt(query, results) {
+    const globalPreamble = typeof ClaudeAPI.getGlobalSystemPreamble === 'function'
+      ? ClaudeAPI.getGlobalSystemPreamble()
+      : null;
+
     const formattedResults = results
       .map((result, index) => {
-        const html = typeof result.analysisHtml === 'string'
-          ? result.analysisHtml.trim()
-          : '';
+        const ragContext = Array.isArray(result.ragChunks) && result.ragChunks.length
+          ? result.ragChunks
+              .map((chunk, chunkIndex) => {
+                const scoreLabel = typeof chunk.score === 'number'
+                  ? chunk.score.toFixed(2)
+                  : (chunk.score || null);
+                const coverageLabel = typeof chunk.coverage === 'number' && chunk.coverage > 0
+                  ? `${Math.round(chunk.coverage * 100)}%`
+                  : null;
+                const meta = [scoreLabel ? `score ${scoreLabel}` : null, coverageLabel ? `coverage ${coverageLabel}` : null]
+                  .filter(Boolean)
+                  .join(', ');
+                const heading = `Segment ${chunk.order ?? chunkIndex + 1}${meta ? ` (${meta})` : ''}`;
+                const body = (chunk.promptText || chunk.text || chunk.content || '').trim();
+                return `${heading}:\n${body}`;
+              })
+              .join('\n---\n')
+          : null;
+
+        const plainTextContext = typeof result.analysisPlainText === 'string'
+          ? (() => {
+              const trimmed = result.analysisPlainText.trim();
+              if (!trimmed) {
+                return null;
+              }
+              return trimmed.length > RAG_FALLBACK_PROMPT_LIMIT
+                ? `${trimmed.slice(0, RAG_FALLBACK_PROMPT_LIMIT)}…`
+                : trimmed;
+            })()
+          : null;
+
         const snippet = result.snippet
           ? result.snippet.replace(/\s+/g, ' ').trim()
           : 'No snippet provided.';
-        const label = html ? `Page HTML (truncated to ${html.length} characters)` : 'Snippet';
-        const content = html || snippet;
+        const label = ragContext
+          ? `Top page segments (${result.ragChunks.length} chunk${result.ragChunks.length === 1 ? '' : 's'})`
+          : plainTextContext
+            ? `Page text summary (${plainTextContext.length} characters)`
+            : 'Snippet';
+        const content = ragContext || plainTextContext || snippet;
 
         return `${index + 1}. Title: ${result.title}\n   URL: ${result.url}\n   ${label}:\n"""${content}"""`;
       })
       .join('\n\n');
 
-    return `You are a fast research assistant helping a shopping extension answer the user's research query.\n` +
+    const preamble = globalPreamble ? `${globalPreamble}\n\n` : '';
+
+    return `${preamble}You are a fast research assistant helping a shopping extension answer the user's research query.\n` +
       `Identify the primary intent of the query (e.g., price, availability, color options, specs, reviews, authenticity) and surface the most relevant facts for that intent.\n` +
-      `Many results include truncated raw HTML from the page; leverage the structure and content to extract concrete facts (numbers, named colors, specific features, pros/cons, release dates, etc.). When HTML is not available, rely on the snippet, title, and domain reputation to infer useful context instead of claiming there is no data.\n` +
+      `Many results include extracted text segments from the page. Use them to pull concrete facts such as prices, configuration details, availability windows, review sentiments, and release dates. Avoid quoting markup or CSS tokens.\n` +
+      `Deliver a thorough, grounded synthesis: write a 4-6 sentence summary that compares the strongest data points, explicitly citing price ranges, timeframes, model identifiers, and retailer context when available.\n` +
+      `Ensure each key finding is a complete sentence anchored to a specific source segment, and include at least four findings when the evidence supports it. Highlight differences (e.g., chip generation, storage SKUs) rather than repeating the same fact.\n` +
       `Only state that information is missing when none of the results provide a credible signal after reasonable inference.\n\n` +
       `Search Query: ${query}\n\n` +
       `DuckDuckGo Results:\n${formattedResults}\n\n` +
       `Reply strictly as JSON with this exact schema:\n` +
       `{\n` +
-      `  "summary": "2-3 sentence factual overview that directly answers the query, highlighting the most relevant concrete details (prices, colors, specs, dates, etc.)",\n` +
-      `  "keyFindings": ["succinct bullet findings grounded in the snippets with the most pertinent facts for this query"],\n` +
+      `  "summary": "4-6 sentence factual overview that directly answers the query, highlighting the most relevant concrete details (prices, colors, specs, dates, availability, retailer context).",\n` +
+      `  "keyFindings": ["succinct bullet findings grounded in the provided segments with the most pertinent facts for this query; include at least four when possible"],\n` +
       `  "bestLinks": [{"title": "Result title", "url": "https://example.com", "reason": "Specific evidence from this link that helps answer the query"}],\n` +
       `  "missingInfo": "What the snippets do not cover or what needs further research",\n` +
       `  "confidence": 0.0\n` +
@@ -440,7 +500,7 @@ export class WebSearch {
     return results;
   }
 
-  static async populateAnalysisHtml(results, maxFetches = 5, maxChars = ANALYSIS_HTML_MAX_LENGTH) {
+  static async populateAnalysisHtml(results, maxFetches = 5, maxChars = ANALYSIS_HTML_MAX_LENGTH, query = '') {
     if (!Array.isArray(results) || !results.length || maxFetches <= 0) {
       return;
     }
@@ -461,11 +521,38 @@ export class WebSearch {
             if (!html) {
               return;
             }
-            result.analysisHtml = html;
+
+            const truncatedHtml = html.length > maxChars ? html.slice(0, maxChars) : html;
+            result.analysisHtml = truncatedHtml;
+
+            const ragPayload = this.createPageRagPayload(query, truncatedHtml, {
+              chunkSize: RAG_CHUNK_SIZE,
+              chunkOverlap: RAG_CHUNK_OVERLAP,
+              maxChunks: RAG_MAX_CHUNKS_PER_RESULT
+            });
+
+            if (ragPayload) {
+              result.ragChunks = ragPayload.ragChunks;
+              result.analysisPlainText = ragPayload.plainText;
+              if (!result.snippet && ragPayload.snippet) {
+                result.snippet = ragPayload.snippet;
+              }
+            }
+
+            if (!result.analysisPlainText) {
+              const fallbackPlainText = this.extractPlainTextForRag(truncatedHtml);
+              if (fallbackPlainText) {
+                result.analysisPlainText = fallbackPlainText;
+                if (!result.snippet) {
+                  result.snippet = fallbackPlainText.slice(0, 500);
+                }
+              }
+            }
+
             if (!result.snippet) {
-              const plainText = this.cleanText(this.stripHtml(html));
-              if (plainText) {
-                result.snippet = plainText.slice(0, 500);
+              const cleanFallback = this.cleanText(this.stripHtml(truncatedHtml));
+              if (cleanFallback) {
+                result.snippet = cleanFallback.slice(0, 500);
               }
             }
           })
@@ -478,6 +565,384 @@ export class WebSearch {
     if (tasks.length > 0) {
       await Promise.allSettled(tasks);
     }
+  }
+
+  static createPageRagPayload(query, html, options = {}) {
+    if (!html || typeof html !== 'string') {
+      return null;
+    }
+
+    const {
+      chunkSize = RAG_CHUNK_SIZE,
+      chunkOverlap = RAG_CHUNK_OVERLAP,
+      maxChunks = RAG_MAX_CHUNKS_PER_RESULT
+    } = options;
+
+    const plainText = this.extractPlainTextForRag(html);
+    if (!plainText) {
+      return null;
+    }
+
+    const querySignals = this.computeQuerySignals(query, chunkSize);
+    const rawChunks = this.chunkTextForRag(plainText, chunkSize, chunkOverlap);
+    if (!rawChunks.length) {
+      return {
+        plainText,
+        ragChunks: [],
+        snippet: plainText.slice(0, 500)
+      };
+    }
+
+    const scoredChunks = rawChunks
+      .map((chunk, index) => {
+        const sanitizedText = this.pruneCssNoiseFromText(chunk.content || '');
+        if (!sanitizedText) {
+          return null;
+        }
+        const scoreData = this.scoreChunkForRag(sanitizedText, querySignals);
+        return {
+          index,
+          text: sanitizedText,
+          score: scoreData.score,
+          coverage: scoreData.coverage
+        };
+      })
+      .filter(Boolean)
+      .filter(entry => this.hasReadableContent(entry.text))
+      .filter(entry => entry.score >= RAG_MIN_SCORE || entry.index === 0);
+
+    const sorted = scoredChunks.sort((a, b) => b.score - a.score);
+    const topChunks = sorted
+      .slice(0, maxChunks)
+      .map((entry, order) => ({
+        order: order + 1,
+        index: entry.index,
+        score: Number.isFinite(entry.score) ? Number(entry.score.toFixed(3)) : entry.score,
+        coverage: Number.isFinite(entry.coverage) ? Number(entry.coverage.toFixed(3)) : entry.coverage,
+        text: entry.text,
+        promptText: entry.text.length > RAG_CHUNK_PROMPT_LIMIT
+          ? `${entry.text.slice(0, RAG_CHUNK_PROMPT_LIMIT).trim()}…`
+          : entry.text.trim()
+      }));
+
+    const snippetSource = topChunks[0]?.text || plainText;
+
+    const limitedPlainText = plainText.length > ANALYSIS_HTML_MAX_LENGTH
+      ? plainText.slice(0, ANALYSIS_HTML_MAX_LENGTH)
+      : plainText;
+
+    return {
+      plainText: limitedPlainText,
+      ragChunks: topChunks,
+      snippet: snippetSource ? snippetSource.slice(0, 500) : null
+    };
+  }
+
+  static computeQuerySignals(rawQuery, chunkTarget) {
+    const query = (rawQuery || '').toString().toLowerCase();
+    const tokens = this.tokenizeForRag(query).filter(token => !STOPWORDS.has(token));
+
+    const dedupedTokens = [];
+    const seen = new Set();
+    tokens.forEach(token => {
+      if (!seen.has(token)) {
+        seen.add(token);
+        dedupedTokens.push(token);
+      }
+    });
+
+    const phrases = [];
+    for (let i = 0; i < dedupedTokens.length - 1; i += 1) {
+      const phrase = `${dedupedTokens[i]} ${dedupedTokens[i + 1]}`;
+      phrases.push(phrase);
+    }
+
+    const hasPriceIntent = dedupedTokens.some(token => PRICE_KEYWORDS.has(token));
+    const numericTokens = dedupedTokens.filter(token => /\d/.test(token));
+
+    return {
+      tokens: dedupedTokens,
+      phrases,
+      hasPriceIntent,
+      numericTokens,
+      chunkTarget: chunkTarget || RAG_CHUNK_SIZE
+    };
+  }
+
+  static extractPlainTextForRag(html) {
+    if (!html) {
+      return '';
+    }
+
+    let text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+      .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
+      .replace(/<!--([\s\S]*?)-->/g, ' ');
+
+    text = text
+      .replace(/<(\/)?(h[1-6]|p|div|section|article|li|ul|ol|tr|td|th|table|header|footer|main)[^>]*>/gi, '\n')
+      .replace(/<(br|hr)\s*\/?>/gi, '\n')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\u00A0/g, ' ')
+      .replace(/\r/g, '\n');
+
+    text = text
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{2,}/g, '\n')
+      .replace(/[ \t]+/g, ' ');
+
+    const lines = text
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    const cleanedLines = this.filterOutCssNoise(lines);
+    return cleanedLines.join('\n');
+  }
+
+  static chunkTextForRag(text, chunkSize, chunkOverlap) {
+    if (!text || !text.length) {
+      return [];
+    }
+
+    const sentences = text
+      .split(/\r?\n+/)
+      .flatMap(paragraph => (paragraph.match(/[^.!?\n]+[.!?]?/g) || [paragraph]))
+      .map(sentence => sentence.trim())
+      .filter(Boolean);
+
+    if (!sentences.length) {
+      return [];
+    }
+
+    const chunks = [];
+    const maxLength = Math.max(200, chunkSize);
+    const minLength = Math.min(180, Math.floor(chunkSize * 0.4));
+    const step = Math.max(1, chunkSize - chunkOverlap);
+
+    let buffer = '';
+
+    const pushBuffer = () => {
+      const candidate = buffer.trim();
+      if (!candidate.length) {
+        return;
+      }
+      if (candidate.length < Math.min(80, minLength) && chunks.length) {
+        return;
+      }
+      chunks.push({ content: candidate });
+      buffer = '';
+    };
+
+    const emitLongSentence = (sentence) => {
+      let start = 0;
+      while (start < sentence.length) {
+        const slice = sentence.slice(start, start + maxLength).trim();
+        if (slice.length >= minLength) {
+          chunks.push({ content: slice });
+        }
+        start += step;
+      }
+    };
+
+    sentences.forEach(sentence => {
+      const candidate = buffer ? `${buffer} ${sentence}` : sentence;
+      if (candidate.length <= maxLength) {
+        buffer = candidate;
+        return;
+      }
+
+      pushBuffer();
+
+      if (sentence.length > maxLength) {
+        emitLongSentence(sentence);
+        buffer = '';
+      } else {
+        buffer = sentence;
+      }
+    });
+
+    pushBuffer();
+
+    if (chunkOverlap <= 0 || chunks.length <= 1) {
+      return chunks;
+    }
+
+    const overlapped = [];
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      if (i === 0) {
+        overlapped.push({ content: chunk.content });
+        continue;
+      }
+
+      const prev = overlapped[overlapped.length - 1];
+      const overlapSlice = prev.content.slice(-chunkOverlap);
+      overlapped.push({
+        content: `${overlapSlice} ${chunk.content}`.trim()
+      });
+    }
+
+    return overlapped;
+  }
+
+  static filterOutCssNoise(lines) {
+    if (!Array.isArray(lines)) {
+      return [];
+    }
+
+    return lines.filter(line => {
+      const trimmed = line.trim();
+      if (!trimmed.length) {
+        return false;
+      }
+      return !this.looksLikeCssLine(trimmed);
+    });
+  }
+
+  static pruneCssNoiseFromText(text) {
+    if (!text || typeof text !== 'string') {
+      return '';
+    }
+    const cleaned = text
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length)
+      .filter(line => !this.looksLikeCssLine(line));
+
+    return cleaned.join('\n').trim();
+  }
+
+  static looksLikeCssLine(line) {
+    if (!line) {
+      return true;
+    }
+    const trimmed = line.trim();
+
+    if (!trimmed.length) {
+      return true;
+    }
+
+    if (trimmed.startsWith('@media') || trimmed.startsWith('@font-face') || trimmed.startsWith(':root')) {
+      return true;
+    }
+
+    if (/[{}]/.test(trimmed)) {
+      return true;
+    }
+
+    if (/--[a-z0-9-]+\s*:/.test(trimmed)) {
+      return true;
+    }
+
+    const cssPropertyPattern = /\b(display|margin|padding|font|color|background|border|flex|grid|position|align|justify|gap|width|height|left|right|top|bottom|opacity|visibility|transform|transition|animation|box-shadow|text-align|line-height|letter-spacing|z-index)\b/i;
+    if (/;\s*$/.test(trimmed) && cssPropertyPattern.test(trimmed)) {
+      return true;
+    }
+
+    if (/^[.#][\w-]+\s*(,|\{|:)/.test(trimmed)) {
+      return true;
+    }
+
+    if (cssPropertyPattern.test(trimmed) && trimmed.includes(':') && !/[.!?]$/.test(trimmed)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  static hasReadableContent(text) {
+    if (!text || typeof text !== 'string') {
+      return false;
+    }
+
+    const plain = text.replace(/\s+/g, ' ').trim();
+    if (!plain.length) {
+      return false;
+    }
+
+    const letters = (plain.match(/[a-zA-Z]/g) || []).length;
+    if (letters < 12) {
+      return false;
+    }
+
+    const punctuation = (plain.match(/[{};<>]/g) || []).length;
+    if (punctuation > letters * 0.8) {
+      return false;
+    }
+
+    const words = plain.match(/[a-zA-Z0-9$€£]+/g) || [];
+    const meaningful = words.filter(word => word.length >= 3 || /\d/.test(word));
+
+    return meaningful.length >= 3;
+  }
+
+  static tokenizeForRag(text) {
+    if (!text) {
+      return [];
+    }
+
+    const matches = text.toLowerCase().match(/[a-z0-9$€£.%-]+/g);
+    return matches ? matches.filter(token => token.length > 1 || /\d/.test(token)) : [];
+  }
+
+  static scoreChunkForRag(chunkText, querySignals) {
+    if (!chunkText) {
+      return { score: 0, coverage: 0 };
+    }
+
+    const chunkLower = chunkText.toLowerCase();
+    let score = 0;
+    let matchedTokens = 0;
+
+    querySignals.tokens.forEach(token => {
+      if (!token) {
+        return;
+      }
+
+      let occurrences = 0;
+      let position = chunkLower.indexOf(token);
+      while (position !== -1) {
+        occurrences += 1;
+        position = chunkLower.indexOf(token, position + token.length);
+      }
+
+      if (occurrences > 0) {
+        matchedTokens += 1;
+        const numericWeight = /\d/.test(token) ? 2.2 : 1;
+        score += numericWeight * (0.8 + Math.log2(occurrences + 1));
+      }
+    });
+
+    querySignals.phrases.forEach(phrase => {
+      if (phrase && chunkLower.includes(phrase)) {
+        score += 1.5;
+      }
+    });
+
+    if (querySignals.hasPriceIntent && /[$€£]\s?\d+/.test(chunkLower)) {
+      score += 1.2;
+    }
+
+    if (querySignals.numericTokens.length && /\d/.test(chunkLower)) {
+      score += querySignals.numericTokens.length * 0.1;
+    }
+
+    if (matchedTokens === 0 && !querySignals.phrases.some(phrase => chunkLower.includes(phrase))) {
+      score *= 0.2;
+    }
+
+    const lengthNormalizer = Math.max(1, Math.log2(chunkText.length + 64));
+    score = score / lengthNormalizer;
+
+    const coverage = querySignals.tokens.length
+      ? matchedTokens / querySignals.tokens.length
+      : 0;
+
+    return { score, coverage };
   }
 
   static applyAnalysisSnippets(results, analysis) {
@@ -536,6 +1001,13 @@ export class WebSearch {
       if (reason) {
         result.snippet = reason;
       }
+
+      if (!result.snippet && Array.isArray(result.ragChunks) && result.ragChunks.length) {
+        const primaryChunk = result.ragChunks[0]?.text || result.ragChunks[0]?.promptText;
+        if (primaryChunk) {
+          result.snippet = primaryChunk.slice(0, 500);
+        }
+      }
     });
   }
 
@@ -551,6 +1023,13 @@ export class WebSearch {
       }
       if (!result.url || !/^https?:/i.test(result.url)) {
         continue;
+      }
+      if (Array.isArray(result.ragChunks) && result.ragChunks.length) {
+        const primaryChunk = result.ragChunks[0]?.text || result.ragChunks[0]?.promptText;
+        if (primaryChunk) {
+          result.snippet = primaryChunk.slice(0, 500);
+          continue;
+        }
       }
       if (tasks.length >= maxFetches) {
         break;

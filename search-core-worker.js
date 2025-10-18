@@ -2,7 +2,7 @@ import { parentPort } from 'node:worker_threads';
 
 const ALLOWED_PROTOCOLS = new Set(['http:', 'https:']);
 const FETCH_TIMEOUT_MS = Number(process.env.SHOPSCOUT_SEARCH_CORE_TIMEOUT_MS || 10000);
-const PLAYWRIGHT_TIMEOUT_MS = Number(process.env.SHOPSCOUT_SEARCH_CORE_PLAYWRIGHT_TIMEOUT_MS || 15000);
+const PLAYWRIGHT_TIMEOUT_MS = Number(process.env.SHOPSCOUT_SEARCH_CORE_PLAYWRIGHT_TIMEOUT_MS || 3000);
 const PLAYWRIGHT_NETWORK_IDLE_WAIT_MS = Number(process.env.SHOPSCOUT_SEARCH_CORE_PLAYWRIGHT_NETWORK_IDLE_MS || 2000);
 const PLAYWRIGHT_ENABLED = process.env.SHOPSCOUT_SEARCH_CORE_PLAYWRIGHT === 'false' ? false : true;
 

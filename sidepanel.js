@@ -11,6 +11,27 @@ const contentDiv = document.getElementById('content');
 const refreshBtn = document.getElementById('refreshBtn');
 const openChatBtn = document.getElementById('openChatBtn');
 
+const REFRESH_ICON_HTML = '<span aria-hidden="true">⟳</span>';
+const REFRESH_LOADING_HTML = '<span aria-hidden="true">…</span>';
+
+function setContent(html, { preserveScroll = true } = {}) {
+  const scrollY = preserveScroll ? window.scrollY : 0;
+  contentDiv.innerHTML = html;
+
+  requestAnimationFrame(() => {
+    if (preserveScroll) {
+      window.scrollTo(0, scrollY);
+    } else {
+      window.scrollTo(0, 0);
+    }
+  });
+}
+
+// Ensure refresh button starts with the expected icon markup
+if (refreshBtn) {
+  refreshBtn.innerHTML = REFRESH_ICON_HTML;
+}
+
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
   loadCurrentAnalysis();
@@ -230,7 +251,7 @@ function pollForAnalysis() {
  */
 async function handleRefresh() {
   refreshBtn.disabled = true;
-  refreshBtn.textContent = '🔄 Refreshing...';
+  refreshBtn.innerHTML = REFRESH_LOADING_HTML;
 
   try {
     await chrome.runtime.sendMessage({ type: 'REFRESH_ANALYSIS' });
@@ -240,7 +261,7 @@ async function handleRefresh() {
     showError('Failed to refresh analysis.');
   } finally {
     refreshBtn.disabled = false;
-    refreshBtn.textContent = '🔄 Refresh';
+    refreshBtn.innerHTML = REFRESH_ICON_HTML;
   }
 }
 
@@ -283,30 +304,30 @@ function render() {
  * Render loading state
  */
 function showLoading() {
-  contentDiv.innerHTML = `
+  setContent(`
     <div class="loading">
       <div class="spinner"></div>
       <p>Analyzing product...</p>
     </div>
-  `;
+  `, { preserveScroll: false });
 }
 
 /**
  * Render error message
  */
 function showError(message) {
-  contentDiv.innerHTML = `
+  setContent(`
     <div class="error">
       <strong>Error:</strong> ${message}
     </div>
-  `;
+  `, { preserveScroll: false });
 }
 
 /**
  * Render empty state
  */
 function showEmptyState() {
-  contentDiv.innerHTML = `
+  setContent(`
     <div class="empty-state">
       <div class="empty-icon">📦</div>
       <div class="empty-title">No Product Detected</div>
@@ -314,20 +335,20 @@ function showEmptyState() {
         Navigate to an Amazon or eBay product page to see analysis.
       </div>
     </div>
-  `;
+  `, { preserveScroll: false });
 }
 
 /**
  * Render stop message (out of stock, variations, etc.)
  */
 function renderStopMessage(analysis) {
-  contentDiv.innerHTML = `
+  setContent(`
     <div class="stop-message">
       <strong>${analysis.reason}</strong>
       <p>${analysis.message}</p>
     </div>
     ${renderProductInfo(analysis.productData)}
-  `;
+  `, { preserveScroll: false });
 }
 
 /**
@@ -345,7 +366,7 @@ function renderAnalysis(analysis) {
   if (dealSenseBlocked) {
     // Only show the DealSense critical warning - hide all other analysis
     html.push(renderDealSense(analysis.dealSense, analysis.productData, analysis.buyScore, analysis.recommendation));
-    contentDiv.innerHTML = html.join('');
+    setContent(html.join(''));
     return; // Stop rendering - don't show any other analysis
   }
 
@@ -389,7 +410,7 @@ function renderAnalysis(analysis) {
       break;
   }
 
-  contentDiv.innerHTML = html.join('');
+  setContent(html.join(''));
   attachQAEventListeners();
   attachReviewHighlightHandlers();
   attachDealSenseEventListeners();
@@ -404,8 +425,12 @@ function renderProductInfo(product) {
 
   const imageHtml = product.mainImage
     ? `<div style="display: flex; justify-content: center;">
-         <img src="${product.mainImage}" alt="${product.title}" style="width: 100%; max-width: 200px; height: auto; border-radius: 8px; margin-bottom: 12px;">
+         <img src="${product.mainImage}" alt="${product.title}" style="width: 100%; max-width: 220px; max-height: 180px; object-fit: contain; border-radius: var(--radius-md); margin-bottom: 12px;">
        </div>`
+    : '';
+
+  const priceHtml = product.price?.formatted
+    ? `<div style="margin-top: 8px; font-weight: 600; font-size: 16px;">${product.price.formatted}</div>`
     : '';
 
   // Auction info for eBay listings
@@ -413,9 +438,9 @@ function renderProductInfo(product) {
   if (product.listing?.auction) {
     const auction = product.listing.auction;
     auctionHtml = `
-      <div style="margin-top: 12px; padding: 10px; background: #fff3cd; border-radius: 6px; border: 1px solid #ffc107;">
-        <div style="font-weight: 600; margin-bottom: 6px; color: #856404;">⚡ Auction</div>
-        <div style="font-size: 12px; line-height: 1.8; color: #856404;">
+      <div class="alert alert-warning" style="margin-top: 12px;">
+        <h4>⚡ Auction</h4>
+        <div style="font-size: 12px; line-height: 1.8;">
           ${auction.currentBid ? `<div><strong>Current Bid:</strong> ${auction.currentBid.raw}</div>` : ''}
           ${auction.bidCount ? `<div><strong>Bids:</strong> ${auction.bidCount}</div>` : ''}
           ${auction.timeLeft ? `<div><strong>Time Left:</strong> ${auction.timeLeft}</div>` : ''}
@@ -437,17 +462,11 @@ function renderProductInfo(product) {
 
   return `
     <div class="card">
-      <div class="card-title">
-        <span class="card-icon">📦</span>
-        Product Info
-      </div>
+      <div class="card-title">Product Info</div>
       ${imageHtml}
       <div style="font-size: 13px; line-height: 1.6;">
-        <strong>${product.title}</strong><br>
-        <span class="badge ${product.site === 'amazon' ? 'badge-warning' : 'badge-success'}">
-          ${product.site.toUpperCase()}
-        </span>
-        ${product.price?.formatted ? `<span style="margin-left: 12px; font-weight: 600;">${product.price.formatted}</span>` : ''}
+        <strong>${product.title}</strong>
+        ${priceHtml}
         ${listingBadges}
       </div>
       ${auctionHtml}
@@ -483,7 +502,7 @@ function renderBuyScore(buyScore, recommendation) {
           <!-- Gray background arc -->
           <path d="M 30 100 A 70 70 0 0 1 170 100"
                 fill="none"
-                stroke="#e5e7eb"
+                stroke="var(--border)"
                 stroke-width="20"
                 stroke-linecap="round"/>
 
@@ -516,7 +535,7 @@ function renderBuyScore(buyScore, recommendation) {
           <div style="font-size: 16px; font-weight: 600; color: ${recommendation.color}; margin-top: 4px;">
             ${recommendation.verdict}
           </div>
-          <div style="font-size: 13px; color: #6b7280; margin-top: 8px; line-height: 1.4;">
+          <div style="font-size: 13px; color: var(--text-secondary); margin-top: 8px; line-height: 1.4;">
             ${recommendation.message}
           </div>
         </div>
@@ -541,6 +560,82 @@ function renderPriceComparison(priceData) {
   const median = priceData.median;
   const min = priceData.min;
   const max = priceData.max;
+
+  const parsePriceValue = (value) => {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (!value) return null;
+    if (typeof value === 'string') {
+      const numeric = parseFloat(value.replace(/[^0-9.]/g, ''));
+      return Number.isFinite(numeric) ? numeric : null;
+    }
+    if (typeof value === 'object') {
+      return parsePriceValue(value.amount ?? value.value ?? value.raw ?? value.formatted ?? value.price);
+    }
+    return null;
+  };
+
+  const rawComparables = Array.isArray(priceData.comparables) ? priceData.comparables.filter(Boolean) : [];
+  const normalizedComparables = rawComparables.map((comp, index) => {
+    const priceValue = parsePriceValue(comp.price ?? comp.priceValue ?? comp.amount ?? comp.avgPrice);
+    const priceLabel = typeof priceValue === 'number'
+      ? `$${priceValue.toFixed(2)}`
+      : (comp.priceFormatted || comp.formattedPrice || comp.price || 'N/A');
+
+    return {
+      title: comp.title || comp.name || comp.label || `Listing ${index + 1}`,
+      priceLabel,
+      priceValue: typeof priceValue === 'number' ? priceValue : null,
+      condition: comp.condition || comp.subtitle || comp.note || '',
+      source: comp.source || comp.marketplace || comp.site || '',
+      url: comp.url || comp.link || '',
+      description: comp.description || '',
+      type: 'listing'
+    };
+  }).filter(item => item.title || item.priceLabel);
+
+  let comparablesForUi = normalizedComparables;
+
+  if (!comparablesForUi.length) {
+    const derived = [];
+    if (min != null) {
+      derived.push({
+        title: 'Lowest Recent Price',
+        priceLabel: formatPrice(min),
+        priceValue: min,
+        condition: 'Best observed price',
+        source: 'Market data',
+        description: 'Lowest price seen across recent listings.',
+        type: 'stat'
+      });
+    }
+    if (median != null) {
+      derived.push({
+        title: 'Median Market Price',
+        priceLabel: formatPrice(median),
+        priceValue: median,
+        condition: 'Typical going rate',
+        source: 'Market data',
+        description: 'Median price calculated from available comparables.',
+        type: 'stat'
+      });
+    }
+    if (max != null && max !== min) {
+      derived.push({
+        title: 'Highest Recent Price',
+        priceLabel: formatPrice(max),
+        priceValue: max,
+        condition: 'Highest observed price',
+        source: 'Market data',
+        description: 'Upper bound seen across recent listings.',
+        type: 'stat'
+      });
+    }
+
+    comparablesForUi = derived;
+  }
+
+  const comparablesCountDisplay = comparablesForUi.length || priceData.compCount || 0;
+  const comparablesDataAttr = JSON.stringify(comparablesForUi).replace(/'/g, '&apos;');
 
   // Calculate positions on the number line
   let lineHtml = '';
@@ -568,16 +663,16 @@ function renderPriceComparison(priceData) {
 
     let priceStatus = 'Above Market';
     let priceStatusClass = 'badge-danger';
-    let currentColor = '#ef4444';
+    let currentColor = 'var(--negative-strong)';
 
     if (withinTolerance) {
       priceStatus = 'At Market';
       priceStatusClass = 'badge-info';
-      currentColor = '#3b82f6';
+      currentColor = 'var(--accent-strong)';
     } else if (current < median - tolerance) {
       priceStatus = 'Below Market';
       priceStatusClass = 'badge-success';
-      currentColor = '#22c55e';
+      currentColor = 'var(--positive-strong)';
     }
 
     lineHtml = `
@@ -593,33 +688,33 @@ function renderPriceComparison(priceData) {
         <div style="position: relative; height: 90px; margin: 0 20px;">
           <!-- Segmented bar with median divider -->
           <div style="position: absolute; top: 44px; left: 0; right: 0; height: 12px;">
-            <div style="position: absolute; inset: 0; border-radius: 8px; background: #e5e7eb;"></div>
-            <div style="position: absolute; top: 0; bottom: 0; left: 0; width: ${medianClamped}%; background: rgba(34,197,94,0.85); border-radius: 8px 0 0 8px;"></div>
-            <div style="position: absolute; top: 0; bottom: 0; left: ${medianClamped}%; width: ${Math.max(0, 100 - medianClamped)}%; background: rgba(239,68,68,0.85); border-radius: 0 8px 8px 0;"></div>
-            <div style="position: absolute; top: -8px; bottom: -8px; left: ${medianClamped}%; width: 3px; background: #3b82f6; border-radius: 2px; transform: translateX(-50%);"></div>
+            <div style="position: absolute; inset: 0; border-radius: 8px; background: var(--border);"></div>
+            <div style="position: absolute; top: 0; bottom: 0; left: 0; width: ${medianClamped}%; background: var(--positive-fill); border-radius: 8px 0 0 8px;"></div>
+            <div style="position: absolute; top: 0; bottom: 0; left: ${medianClamped}%; width: ${Math.max(0, 100 - medianClamped)}%; background: var(--negative-fill); border-radius: 0 8px 8px 0;"></div>
+            <div style="position: absolute; top: -8px; bottom: -8px; left: ${medianClamped}%; width: 3px; background: var(--accent-strong); border-radius: 2px; transform: translateX(-50%);"></div>
           </div>
 
           <!-- Min marker -->
           <div style="position: absolute; left: ${minClamped}%; top: 64px; transform: translateX(-50%);">
-            <div style="width: 2px; height: 8px; background: #6b7280; margin: 0 auto;"></div>
-            <div style="font-size: 10px; color: #6b7280; margin-top: 4px; white-space: nowrap;">Best<br>${formatPrice(min)}</div>
+            <div style="width: 2px; height: 8px; background: var(--text-secondary); margin: 0 auto;"></div>
+            <div style="font-size: 10px; color: var(--text-secondary); margin-top: 4px; white-space: nowrap;">Best<br>${formatPrice(min)}</div>
           </div>
 
           <!-- Max marker -->
           <div style="position: absolute; left: ${maxClamped}%; top: 64px; transform: translateX(-50%);">
-            <div style="width: 2px; height: 8px; background: #6b7280; margin: 0 auto;"></div>
-            <div style="font-size: 10px; color: #6b7280; margin-top: 4px; white-space: nowrap;">Worst<br>${formatPrice(max)}</div>
+            <div style="width: 2px; height: 8px; background: var(--text-secondary); margin: 0 auto;"></div>
+            <div style="font-size: 10px; color: var(--text-secondary); margin-top: 4px; white-space: nowrap;">Worst<br>${formatPrice(max)}</div>
           </div>
 
           <!-- Median marker -->
           <div style="position: absolute; left: ${medianClamped}%; top: 64px; transform: translateX(-50%);">
-            <div style="width: 3px; height: 8px; background: #3b82f6; margin: 0 auto; border-radius: 2px;"></div>
-            <div style="font-size: 11px; font-weight: 600; color: #3b82f6; margin-top: 4px; white-space: nowrap;">Median<br>${formatPrice(median)}</div>
+            <div style="width: 3px; height: 8px; background: var(--accent-strong); margin: 0 auto; border-radius: 2px;"></div>
+            <div style="font-size: 11px; font-weight: 600; color: var(--accent-strong); margin-top: 4px; white-space: nowrap;">Median<br>${formatPrice(median)}</div>
           </div>
 
           <!-- Current price marker (circle) -->
           <div style="position: absolute; left: ${currentClamped}%; top: 16px; transform: translateX(-50%);">
-            <div style="width: 14px; height: 14px; background: ${currentColor}; border: 3px solid white; border-radius: 50%; margin: 0 auto; box-shadow: 0 2px 8px rgba(0,0,0,0.2);"></div>
+            <div style="width: 14px; height: 14px; background: ${currentColor}; border: 3px solid var(--surface); border-radius: 50%; margin: 0 auto; box-shadow: 0 2px 8px rgba(0,0,0,0.2);"></div>
             <div style="font-size: 13px; font-weight: 700; color: ${currentColor}; margin-top: -32px; white-space: nowrap; text-align: center;">
               ${formatPrice(current)}
             </div>
@@ -629,12 +724,12 @@ function renderPriceComparison(priceData) {
 
       <!-- Stats row -->
       <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 28px;">
-        <div class="comparables-btn" data-comparables='${JSON.stringify(priceData.comparables || []).replace(/'/g, '&apos;')}' style="text-align: center; padding: 10px; background: #f8fafc; border-radius: 6px; cursor: pointer; border: 1px solid #e5e7eb; transition: all 0.2s;">
-          <div style="font-size: 11px; color: #6b7280; margin-bottom: 4px;">Comparables</div>
-          <div style="font-size: 16px; font-weight: 600;">${priceData.compCount || 0}</div>
+        <div class="comparables-btn" data-comparables='${comparablesDataAttr}' style="text-align: center; padding: 10px; background: var(--surface-muted); border-radius: 6px; cursor: pointer; border: 1px solid var(--border); transition: all 0.2s;">
+          <div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 4px;">Comparables</div>
+          <div style="font-size: 16px; font-weight: 600;">${comparablesCountDisplay}</div>
         </div>
-        <div style="text-align: center; padding: 10px; background: #f8fafc; border-radius: 6px; border: 1px solid transparent;">
-          <div style="font-size: 11px; color: #6b7280; margin-bottom: 4px;">vs Median</div>
+        <div style="text-align: center; padding: 10px; background: var(--surface-muted); border-radius: 6px; border: 1px solid transparent;">
+          <div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 4px;">vs Median</div>
           <div style="font-size: 16px; font-weight: 600; color: ${currentColor};">
             ${withinTolerance ? '≈$0.00' : `${diffFromMedian < 0 ? '-' : '+'}$${Math.abs(diffFromMedian).toFixed(2)}`}
           </div>
@@ -660,20 +755,17 @@ function renderPriceComparison(priceData) {
           <div class="price-label">Best Price</div>
           <div class="price-value">${formatPrice(min)}</div>
         </div>
-        <div class="price-item">
-          <div class="price-label">Comparables</div>
-          <div class="price-value">${priceData.compCount || 0}</div>
-        </div>
+      <div class="price-item">
+        <div class="price-label">Comparables</div>
+        <div class="price-value">${comparablesCountDisplay}</div>
       </div>
-    `;
+    </div>
+  `;
   }
 
   return `
     <div class="card">
-      <div class="card-title">
-        <span class="card-icon">💰</span>
-        Price Comparison
-      </div>
+      <div class="card-title">Price Comparison</div>
       ${lineHtml}
     </div>
   `;
@@ -690,10 +782,7 @@ function renderSentimentAnalysis(sentiment) {
 
   return `
     <div class="card">
-      <div class="card-title">
-        <span class="card-icon">💭</span>
-        Review Analysis
-      </div>
+      <div class="card-title">Review Analysis</div>
       <div class="pros-cons">
         <div class="pros">
           <h4>Pros</h4>
@@ -716,27 +805,42 @@ function renderReviewHighlights(product) {
   if (!product?.reviews?.length) return '';
 
   const reviewItems = product.reviews.slice(0, 5).map(review => {
-    const rating = typeof review.rating === 'number' ? `${review.rating.toFixed(1)}/5` : 'N/A';
+    const numberRating = typeof review.rating === 'number' ? review.rating : null;
+    const ratingLabel = numberRating != null ? `${numberRating.toFixed(1)}/5` : '';
+    const ratingDisplay = ratingLabel || 'Rating unavailable';
     const helpful = typeof review.helpfulCount === 'number' ? `${review.helpfulCount} found helpful` : '';
-    const badgeHtml = (review.badges || []).map(badge => `<span class="badge badge-info" style="margin-right: 6px;">${badge}</span>`).join('');
+    const badgeElements = (review.badges || []).map(badge => `<span class="badge badge-info">${badge}</span>`).join('');
     const highlightButton = review.selector
       ? `<button class="link-button review-highlight-btn" data-highlight-selector="${review.selector}">📍 View on page</button>`
       : '';
     const bodyText = review.body || 'No review text available.';
+    const normalizedTitle = (review.title || '').trim();
+    const titleLooksLikeRating = normalizedTitle && normalizedTitle.toLowerCase().includes('out of 5');
+    const titleHtml = normalizedTitle && !titleLooksLikeRating
+      ? `<div style="font-weight: 600; color: var(--text-primary);">${normalizedTitle}</div>`
+      : '';
+    const metaParts = [];
+    if (review.author) metaParts.push(`by ${review.author}`);
+    if (helpful) metaParts.push(helpful);
+    const metaLine = metaParts.length
+      ? `<div style="font-size: 12px; color: var(--text-secondary); display: flex; flex-wrap: wrap; gap: 12px;">${metaParts.map(part => `<span>${part}</span>`).join('')}</div>`
+      : '';
+    const badgeLine = badgeElements
+      ? `<div style="margin-top: 6px; display: flex; flex-wrap: wrap; gap: 8px;">${badgeElements}</div>`
+      : '';
 
     return `
-      <details class="review-highlight" style="border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; margin-bottom: 12px;">
-        <summary style="cursor: pointer; display: flex; flex-direction: column; gap: 6px;">
+      <details class="review-highlight" style="padding: 12px; margin-bottom: 12px;">
+        <summary style="cursor: pointer; display: flex; flex-direction: column; gap: 8px;">
           <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
-            <div style="font-weight: 600; color: #2563eb;">${rating}</div>
-            <div style="font-size: 12px; color: #6b7280;">${review.date || ''}</div>
+            <div style="display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--accent-strong);">
+              ${ratingDisplay}
+            </div>
+            <div style="font-size: 12px; color: var(--text-secondary);">${review.date || ''}</div>
           </div>
-          <div style="font-weight: 600; color: #111827;">${review.title || 'Untitled review'}</div>
-          <div style="font-size: 12px; color: #6b7280; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
-            ${review.author ? `<span>by ${review.author}</span>` : ''}
-            ${helpful ? `<span>${helpful}</span>` : ''}
-            ${badgeHtml}
-          </div>
+          ${titleHtml}
+          ${metaLine}
+          ${badgeLine}
         </summary>
         <div style="margin-top: 10px; font-size: 13px; line-height: 1.6;">${bodyText}</div>
         <div style="margin-top: 10px;">${highlightButton}</div>
@@ -746,10 +850,7 @@ function renderReviewHighlights(product) {
 
   return `
     <div class="card">
-      <div class="card-title">
-        <span class="card-icon">⭐</span>
-        Top On-Page Reviews
-      </div>
+      <div class="card-title">Top On-Page Reviews</div>
       <div>${reviewItems}</div>
     </div>
   `;
@@ -769,10 +870,7 @@ function renderExternalReviewIntel(externalReviews) {
 
   return `
     <div class="card">
-      <div class="card-title">
-        <span class="card-icon">🌐</span>
-        Web Consensus
-      </div>
+      <div class="card-title">Web Consensus</div>
       <div style="font-size: 13px; line-height: 1.6;">
         <div style="margin-bottom: 8px; color: #6b7280;">Search query: <strong>${query}</strong></div>
         <div style="margin-bottom: 12px;">${analysis.summary || 'No summary available.'}</div>
@@ -799,10 +897,7 @@ function renderSpecAnalysis(specAnalysis) {
 
   return `
     <div class="card">
-      <div class="card-title">
-        <span class="card-icon">📋</span>
-        Specification Analysis
-      </div>
+      <div class="card-title">Specification Analysis</div>
       ${conflicts.length > 0
         ? `<div class="error" style="margin-top: 12px;">
             <strong>Conflicts Found:</strong>
@@ -824,10 +919,7 @@ function renderFitAnalysis(fitAnalysis) {
 
   return `
     <div class="card">
-      <div class="card-title">
-        <span class="card-icon">👕</span>
-        Fit & Sizing Analysis
-      </div>
+      <div class="card-title">Fit & Sizing Analysis</div>
       <div class="pros-cons">
         <div class="pros">
           <h4>Fit Insights</h4>
@@ -854,10 +946,7 @@ function renderBeautyAnalysis(beautyAnalysis) {
 
   return `
     <div class="card">
-      <div class="card-title">
-        <span class="card-icon">💄</span>
-        Beauty Product Analysis
-      </div>
+      <div class="card-title">Beauty Product Analysis</div>
       <div style="font-size: 13px; line-height: 1.6;">
         ${beautyAnalysis.summary || 'Analysis in progress...'}
       </div>
@@ -873,10 +962,7 @@ function renderSoldComps(soldComps) {
 
   return `
     <div class="card">
-      <div class="card-title">
-        <span class="card-icon">📊</span>
-        Sold Comparables
-      </div>
+      <div class="card-title">Sold Comparables</div>
       <div class="price-comparison">
         <div class="price-item">
           <div class="price-label">Avg Sold Price</div>
@@ -899,10 +985,7 @@ function renderDealSenseBlocked(dealSense) {
 
   let html = `
     <div class="card" style="border: 3px solid #ef4444; background: linear-gradient(to bottom, #ffffff, #fef2f2);">
-      <div class="card-title">
-        <span class="card-icon" style="background: #fee2e2; color: #dc2626;">🚫</span>
-        Critical Warning - DO NOT BID
-      </div>
+      <div class="card-title">Critical Warning - DO NOT BID</div>
       <div style="padding: 14px; background: #fee2e2; border-radius: 8px; border: 2px solid #ef4444; margin-bottom: 16px;">
         <div style="font-weight: 700; font-size: 16px; color: #dc2626; margin-bottom: 8px;">
           ⚠️ SERIOUS ISSUES DETECTED
@@ -958,10 +1041,7 @@ function renderDealSense(dealSense, productData, buyScore, recommendation) {
   // DealSense card can now show even without auction/offer if there's a Buy Score
   let html = `
     <div class="card dealsense-card">
-      <div class="card-title">
-        <span class="card-icon">🎯</span>
-        DealSense Analysis
-      </div>
+      <div class="card-title">DealSense Analysis</div>
   `;
 
   // Buy Score Speedometer (if available)
@@ -986,7 +1066,7 @@ function renderDealSense(dealSense, productData, buyScore, recommendation) {
             <!-- Gray background arc -->
             <path d="M 30 100 A 70 70 0 0 1 170 100"
                   fill="none"
-                  stroke="#e5e7eb"
+                stroke="var(--border)"
                   stroke-width="20"
                   stroke-linecap="round"/>
 
@@ -1269,10 +1349,7 @@ function renderDealSenseInsights(dealSense) {
 function renderQASection() {
   return `
     <div class="card qa-section">
-      <div class="card-title">
-        <span class="card-icon">💬</span>
-        Ask a Question
-      </div>
+      <div class="card-title">Ask a Question</div>
       <div class="qa-input-container">
         <input
           type="text"
@@ -1337,32 +1414,37 @@ function attachComparablesEventListeners() {
       try {
         const comparables = JSON.parse(comparablesData);
 
-        if (comparables.length === 0) {
+        if (!Array.isArray(comparables) || comparables.length === 0) {
           comparablesList.innerHTML = `
             <div class="comparables-list">
-              <div style="text-align: center; color: #6b7280; font-size: 13px;">No comparable listings found</div>
+              <div style="text-align: center; color: var(--text-secondary); font-size: 13px;">No comparable listings found</div>
             </div>
           `;
         } else {
           const itemsHtml = comparables.map((comp, index) => {
-            const price = comp.price ? `$${comp.price.toFixed(2)}` : 'N/A';
-            const condition = comp.condition || 'Unknown condition';
-            const url = comp.url || '#';
             const title = comp.title || `Listing ${index + 1}`;
+            const priceLabel = comp.priceLabel || (typeof comp.priceValue === 'number' ? `$${comp.priceValue.toFixed(2)}` : 'N/A');
+            const condition = comp.condition || (comp.type === 'stat' ? 'Derived insight' : '—');
+            const url = comp.url && comp.url !== '#' ? comp.url : null;
+            const source = comp.source ? `<div style="color: var(--text-secondary); font-size: 11px; margin-top: 2px;">${comp.source}</div>` : '';
+            const description = comp.description ? `<div style="margin-top: 6px; font-size: 12px; color: var(--text-secondary);">${comp.description}</div>` : '';
+            const titleContent = url
+              ? `<a href="${url}" target="_blank" rel="noopener" style="color: #1d4ed8; text-decoration: none;">${title}</a>`
+              : `<span style="color: #1f2937;">${title}</span>`;
 
             return `
               <div class="comparable-item">
-                <div style="font-weight: 600; margin-bottom: 4px; font-size: 13px;">
-                  <a href="${url}" target="_blank" rel="noopener" style="color: #1d4ed8; text-decoration: none;">${title}</a>
+                <div style="font-weight: 600; margin-bottom: 4px; font-size: 13px;">${titleContent}</div>
+                ${source}
+                <div style="display: flex; justify-content: space-between; margin-top: 8px; font-size: 12px;">
+                  <span style="color: var(--text-secondary);">Price:</span>
+                  <span style="font-weight: 600; color: var(--positive-strong);">${priceLabel}</span>
                 </div>
-                <div style="display: flex; justify-content: space-between; margin-top: 6px;">
-                  <span style="color: #6b7280;">Price:</span>
-                  <span style="font-weight: 600; color: #22c55e;">${price}</span>
-                </div>
-                <div style="display: flex; justify-content: space-between; margin-top: 4px;">
-                  <span style="color: #6b7280;">Condition:</span>
+                <div style="display: flex; justify-content: space-between; margin-top: 4px; font-size: 12px;">
+                  <span style="color: var(--text-secondary);">Condition:</span>
                   <span style="font-weight: 500;">${condition}</span>
                 </div>
+                ${description}
               </div>
             `;
           }).join('');

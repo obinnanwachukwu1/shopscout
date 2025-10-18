@@ -7,6 +7,9 @@
 let currentProduct = null;
 let chatHistory = [];
 let currentAnalysis = null;
+const toolStatusMessages = new Map();
+let activeStream = null;
+let lastErroredStreamId = null;
 
 // DOM elements
 const chatMessages = document.getElementById('chatMessages');
@@ -52,10 +55,39 @@ function setupEventListeners() {
 
   // Listen for updates from background
   chrome.runtime.onMessage.addListener((message) => {
-    if (message.type === 'ANALYSIS_UPDATED') {
-      currentAnalysis = message.data || null;
-      currentProduct = message.data?.rawProductData || message.data?.productData || null;
-      updateProductBadge();
+    switch (message.type) {
+      case 'ANALYSIS_UPDATED':
+        currentAnalysis = message.data || null;
+        currentProduct = message.data?.rawProductData || message.data?.productData || null;
+        updateProductBadge();
+        break;
+      case 'CHAT_PROGRESS':
+        handleChatProgress(message.data);
+        break;
+      case 'CHAT_STREAM_START':
+        handleStreamStart(message.data);
+        break;
+      case 'CHAT_STREAM_CHUNK':
+        handleStreamChunk(message.data);
+        break;
+      case 'CHAT_STREAM_END':
+        handleStreamEnd(message.data);
+        break;
+      case 'CHAT_STREAM_ERROR':
+        handleStreamError(message.data);
+        break;
+      case 'QUESTION_ANSWERED':
+        if (!message.data?.streamed) {
+          const data = message.data || {};
+          if (data.streamId && data.streamId === lastErroredStreamId) {
+            lastErroredStreamId = null;
+            break;
+          }
+          addMessage('assistant', data.answer || 'I could not find that information.', data.source || null);
+        }
+        break;
+      default:
+        break;
     }
   });
 }
@@ -137,7 +169,9 @@ async function handleSendMessage() {
     });
 
     if (response.success && response.data) {
-      addMessage('assistant', response.data.answer, response.data.source);
+      if (!response.data.streamed) {
+        addMessage('assistant', response.data.answer || 'I could not find that information.', response.data.source || null);
+      }
     } else {
       addMessage('assistant', 'Sorry, I could not answer that question.');
     }
@@ -150,6 +184,14 @@ async function handleSendMessage() {
     typingIndicator.classList.remove('active');
     chatInput.focus();
   }
+}
+
+function createSourceLink(source) {
+  const sourceLink = document.createElement('div');
+  sourceLink.className = 'message-source';
+  sourceLink.textContent = '📍 View source on page';
+  sourceLink.onclick = () => highlightSource(source);
+  return sourceLink;
 }
 
 /**
@@ -169,11 +211,7 @@ function addMessage(role, content, source = null) {
 
   // Add source link if available
   if (source && role === 'assistant') {
-    const sourceLink = document.createElement('div');
-    sourceLink.className = 'message-source';
-    sourceLink.textContent = '📍 View source on page';
-    sourceLink.onclick = () => highlightSource(source);
-    messageContent.appendChild(sourceLink);
+    messageContent.appendChild(createSourceLink(source));
   }
 
   messageDiv.appendChild(avatar);
@@ -187,6 +225,192 @@ function addMessage(role, content, source = null) {
 
   // Add to history
   chatHistory.push({ role, content, source });
+}
+
+function handleChatProgress(event = {}) {
+  if (!event) return;
+
+  if (event.type === 'tool_call') {
+    handleToolCallEvent(event);
+  }
+}
+
+function handleToolCallEvent(event) {
+  const toolCallId = event?.toolCallId;
+  if (!toolCallId) {
+    return;
+  }
+
+  let entry = toolStatusMessages.get(toolCallId);
+  const queryText = event?.query ? `“${event.query}”` : event?.tool || 'tool';
+
+  if (!entry) {
+    entry = createStatusMessage('🔍', `Searching for ${queryText}...`);
+    toolStatusMessages.set(toolCallId, entry);
+  }
+
+  switch (event.status) {
+    case 'start':
+      entry.avatarEl.textContent = '🔍';
+      entry.primaryEl.textContent = `Searching for ${queryText}...`;
+      entry.secondaryEl.textContent = event.siteFilter ? `Site filter: ${event.siteFilter}` : '';
+      break;
+    case 'complete':
+      entry.avatarEl.textContent = '✅';
+      entry.primaryEl.textContent = `Search complete for ${queryText}`;
+      entry.secondaryEl.textContent = event.summary || '';
+      break;
+    case 'error':
+      entry.avatarEl.textContent = '⚠️';
+      entry.primaryEl.textContent = `Search failed for ${queryText}`;
+      entry.secondaryEl.textContent = event.error || 'Unknown error';
+      break;
+    default:
+      break;
+  }
+}
+
+function createStatusMessage(icon, primaryText, secondaryText = '') {
+  const messageDiv = document.createElement('div');
+  messageDiv.className = 'message status';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'message-avatar';
+  avatar.textContent = icon;
+
+  const messageContent = document.createElement('div');
+  messageContent.className = 'message-content';
+
+  const primaryEl = document.createElement('div');
+  primaryEl.className = 'message-status-primary';
+  primaryEl.textContent = primaryText;
+
+  const secondaryEl = document.createElement('div');
+  secondaryEl.className = 'message-status-secondary';
+  secondaryEl.textContent = secondaryText;
+
+  messageContent.appendChild(primaryEl);
+  messageContent.appendChild(secondaryEl);
+
+  messageDiv.appendChild(avatar);
+  messageDiv.appendChild(messageContent);
+
+  chatMessages.insertBefore(messageDiv, typingIndicator);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+
+  return { messageDiv, avatarEl: avatar, primaryEl, secondaryEl };
+}
+
+function handleStreamStart(data = {}) {
+  if (activeStream && activeStream.messageDiv?.parentNode) {
+    activeStream.messageDiv.remove();
+    activeStream = null;
+  }
+
+  activeStream = createStreamingMessage(
+    data?.streamId || `stream_${Date.now()}`,
+    data?.source || null,
+    data?.search || null
+  );
+}
+
+function createStreamingMessage(streamId, source = null, search = null) {
+  const messageDiv = document.createElement('div');
+  messageDiv.className = 'message assistant streaming';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'message-avatar';
+  avatar.textContent = '🔍';
+
+  const messageContent = document.createElement('div');
+  messageContent.className = 'message-content';
+
+  const textEl = document.createElement('div');
+  textEl.className = 'message-text';
+  messageContent.appendChild(textEl);
+
+  messageDiv.appendChild(avatar);
+  messageDiv.appendChild(messageContent);
+
+  chatMessages.insertBefore(messageDiv, typingIndicator);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+
+  return {
+    streamId,
+    messageDiv,
+    messageContent,
+    textEl,
+    source,
+    search
+  };
+}
+
+function handleStreamChunk(data = {}) {
+  if (!activeStream) {
+    return;
+  }
+
+  if (data?.streamId && activeStream.streamId !== data.streamId) {
+    return;
+  }
+
+  if (typeof data?.chunk === 'string') {
+    activeStream.textEl.textContent += data.chunk;
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+}
+
+function handleStreamEnd(data = {}) {
+  if (!activeStream) {
+    if (typeof data?.fullAnswer === 'string') {
+      addMessage('assistant', data.fullAnswer, data.source || null);
+    }
+    return;
+  }
+
+  if (data?.streamId && activeStream.streamId !== data.streamId) {
+    return;
+  }
+
+  const finalAnswer = typeof data?.fullAnswer === 'string'
+    ? data.fullAnswer
+    : activeStream.textEl.textContent;
+
+  activeStream.textEl.textContent = finalAnswer;
+
+  const source = data?.source || activeStream.source || null;
+  if (source) {
+    activeStream.messageContent.appendChild(createSourceLink(source));
+  }
+
+  chatHistory.push({
+    role: 'assistant',
+    content: finalAnswer,
+    source
+  });
+
+  activeStream = null;
+}
+
+function handleStreamError(data = {}) {
+  const fallback = data?.message || 'Something went wrong while answering.';
+
+  if (data?.streamId) {
+    lastErroredStreamId = data.streamId;
+  }
+
+  if (activeStream) {
+    activeStream.textEl.textContent = fallback;
+    chatHistory.push({
+      role: 'assistant',
+      content: fallback,
+      source: null
+    });
+    activeStream = null;
+    return;
+  }
+
+  addMessage('assistant', fallback);
 }
 
 /**

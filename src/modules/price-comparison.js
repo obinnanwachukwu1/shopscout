@@ -84,19 +84,30 @@ export class PriceComparison {
       const html = await response.text();
       console.log('[Amazon Search] Response HTML length:', html.length);
 
-      // Extract prices from Amazon search results
+      // Extract prices and comparable listings from Amazon search results
       const prices = this.extractAmazonPrices(html);
-      console.log('[Amazon Search] Extracted prices:', prices);
+      const listingComparables = this.extractAmazonListingSummaries(html);
+      const listingPrices = listingComparables.map(item => item.priceValue).filter(value => typeof value === 'number');
 
-      const range = this.calculateIqrRange(prices);
+      console.log('[Amazon Search] Extracted prices:', prices);
+      console.log('[Amazon Search] Listing comparables:', listingComparables.length);
+
+      const combinedPrices = [...prices, ...listingPrices];
+      const filteredPrices = [...new Set(combinedPrices.filter(value => value > 0 && value < 100000))];
+      if (filteredPrices.length === 0) {
+        console.log('[Amazon Search] No valid prices extracted');
+        return this.getEmptyPriceData();
+      }
+      const range = this.calculateIqrRange(filteredPrices);
       return {
-        prices,
-        median: this.calculateMedian(prices),
+        prices: filteredPrices,
+        median: this.calculateMedian(filteredPrices),
         min: range.min,
         max: range.max,
-        compCount: prices.length,
+        compCount: listingComparables.length || filteredPrices.length,
         currentPrice: null,
-        source: 'amazon'
+        source: 'amazon',
+        comparables: listingComparables
       };
     } catch (error) {
       console.error('[Amazon Search] Error:', error);
@@ -128,24 +139,30 @@ export class PriceComparison {
       const html = await response.text();
       console.log('[eBay Search] Response HTML length:', html.length);
 
-      // Extract prices from eBay search results
+      // Extract prices and comparable listings from eBay search results
       const prices = this.extractEbayPrices(html);
-      console.log('[eBay Search] Extracted prices:', prices);
+      const listingComparables = this.extractEbayListingSummaries(html);
+      const listingPrices = listingComparables.map(item => item.priceValue).filter(value => typeof value === 'number');
 
-      if (prices.length === 0) {
+      console.log('[eBay Search] Extracted prices:', prices);
+      console.log('[eBay Search] Listing comparables:', listingComparables.length);
+
+      const combinedPrices = [...prices, ...listingPrices];
+      const filteredPrices = [...new Set(combinedPrices.filter(value => value > 0 && value < 100000))];
+      if (filteredPrices.length === 0) {
         console.log('[eBay Search] No prices from direct search, falling back to DuckDuckGo');
         return await this.searchEbayViaDuckDuckGo(query);
       }
-
-      const range = this.calculateIqrRange(prices);
+      const range = this.calculateIqrRange(filteredPrices);
       return {
-        prices,
-        median: this.calculateMedian(prices),
+        prices: filteredPrices,
+        median: this.calculateMedian(filteredPrices),
         min: range.min,
         max: range.max,
-        compCount: prices.length,
+        compCount: listingComparables.length || filteredPrices.length,
         currentPrice: null,
-        source: 'ebay'
+        source: 'ebay',
+        comparables: listingComparables
       };
     } catch (error) {
       console.error('[eBay Search] Error:', error);
@@ -171,7 +188,7 @@ export class PriceComparison {
 
       const html = await response.text();
       const urls = this.extractUrlsFromDDG(html, 'ebay.com');
-      const prices = await this.extractPricesFromUrls(urls, 'ebay.com');
+      const { prices, comparables } = await this.extractPricesFromUrls(urls, 'ebay.com');
 
       const range = this.calculateIqrRange(prices);
       return {
@@ -179,9 +196,10 @@ export class PriceComparison {
         median: this.calculateMedian(prices),
         min: range.min,
         max: range.max,
-        compCount: prices.length,
+        compCount: comparables.length,
         currentPrice: null,
-        source: 'ebay'
+        source: 'ebay',
+        comparables
       };
     } catch (error) {
       console.error('[eBay DDG Fallback] Error:', error);
@@ -241,42 +259,64 @@ export class PriceComparison {
    * Extract prices from a list of URLs
    */
   static async extractPricesFromUrls(urls, site) {
-    const prices = [];
+    const priceValues = [];
+    const comparables = [];
 
     console.log('[Price Extract] Processing URLs for prices', {
       urlCount: urls.length,
-      site: site
+      site
     });
 
     for (const url of urls) {
       try {
-        // For now, extract price from URL if possible (common in eBay/Amazon URLs)
         const priceFromUrl = this.extractPriceFromUrl(url);
-        if (priceFromUrl) {
-          console.log('[Price Extract] Found price in URL:', {
-            url: url,
-            price: priceFromUrl
+        if (priceFromUrl && priceFromUrl > 0 && priceFromUrl < 100000) {
+          priceValues.push(priceFromUrl);
+          const entry = this.buildComparableEntry({
+            url,
+            priceValue: priceFromUrl,
+            site,
+            source: 'url-pattern'
           });
-          prices.push(priceFromUrl);
+          if (entry) {
+            comparables.push(entry);
+          }
         }
       } catch (error) {
         console.error('[Price Extract] Error extracting price from URL:', error);
       }
     }
 
-    console.log('[Price Extract] Prices from URLs:', prices);
+    console.log('[Price Extract] Prices from URLs:', priceValues);
 
-    // If we couldn't get prices from URLs, try fetching a few pages
-    if (prices.length < 3 && urls.length > 0) {
+    if (priceValues.length < 3 && urls.length > 0) {
       console.log('[Price Extract] Not enough prices from URLs, fetching pages...');
-      const fetchedPrices = await this.fetchPricesFromPages(urls.slice(0, 3), site);
-      console.log('[Price Extract] Prices from fetched pages:', fetchedPrices);
-      prices.push(...fetchedPrices);
+      const pageResults = await this.fetchPricesFromPages(urls.slice(0, 3), site);
+      pageResults.forEach(result => {
+        if (!result || !result.price) return;
+        priceValues.push(result.price);
+        const entry = this.buildComparableEntry({
+          url: result.url,
+          priceValue: result.price,
+          site,
+          source: 'page-scrape'
+        });
+        if (entry) {
+          comparables.push(entry);
+        }
+      });
     }
 
-    const filtered = [...new Set(prices)].filter(p => p > 0 && p < 100000);
-    console.log('[Price Extract] Final filtered prices:', filtered);
-    return filtered;
+    const filteredPrices = [...new Set(priceValues)].filter(p => p > 0 && p < 100000);
+    const filteredComparables = this.dedupeComparables(comparables);
+
+    console.log('[Price Extract] Final filtered prices:', filteredPrices);
+    console.log('[Price Extract] Comparable entries:', filteredComparables.length);
+
+    return {
+      prices: filteredPrices,
+      comparables: filteredComparables
+    };
   }
 
   /**
@@ -305,7 +345,7 @@ export class PriceComparison {
    * Fetch prices from actual pages (fallback)
    */
   static async fetchPricesFromPages(urls, site) {
-    const prices = [];
+    const results = [];
 
     console.log('[Fetch Pages] Fetching prices from pages', {
       urls: urls,
@@ -329,15 +369,104 @@ export class PriceComparison {
           : this.extractAmazonPrices(html);
 
         console.log('[Fetch Pages] Extracted prices from page:', extracted);
-        prices.push(...extracted);
+
+        const priceValue = extracted.find(value => value > 0 && value < 100000);
+        if (priceValue) {
+          results.push({ url, price: priceValue });
+        }
       } catch (error) {
         console.error('[Fetch Pages] Error fetching page:', url, error);
       }
     }
 
-    const result = prices.slice(0, 10);
-    console.log('[Fetch Pages] Final page prices:', result);
-    return result;
+    console.log('[Fetch Pages] Final page results:', results);
+    return results;
+  }
+
+  static buildComparableEntry({ url, priceValue, site, source, title, condition, description }) {
+    if (!url || typeof priceValue !== 'number' || !isFinite(priceValue)) {
+      return null;
+    }
+
+    const hostname = this.getHostname(url) || site || 'marketplace';
+    const resolvedTitle = title?.trim() || this.deriveComparableTitle(url, hostname);
+
+    return {
+      title: resolvedTitle,
+      url,
+      priceValue,
+      priceLabel: `$${priceValue.toFixed(2)}`,
+      condition: condition || '',
+      source: hostname,
+      description: description || '',
+      type: 'listing',
+      origin: source || 'listing'
+    };
+  }
+
+  static dedupeComparables(entries) {
+    if (!Array.isArray(entries)) {
+      return [];
+    }
+
+    const deduped = [];
+    const seen = new Set();
+
+    entries.forEach(entry => {
+      if (!entry || typeof entry.priceValue !== 'number' || !isFinite(entry.priceValue)) {
+        return;
+      }
+
+      const key = `${entry.url || ''}|${entry.priceValue.toFixed(2)}`;
+      if (seen.has(key)) {
+        return;
+      }
+
+      seen.add(key);
+      deduped.push(entry);
+    });
+
+    return deduped.slice(0, 10);
+  }
+
+  static deriveComparableTitle(url, fallback) {
+    try {
+      const parsed = new URL(url);
+      const segments = parsed.pathname.split('/').filter(Boolean);
+      let slug = segments.pop() || segments.pop();
+
+      if (!slug) {
+        return this.toTitleCase(fallback || parsed.hostname.replace(/^www\./, ''));
+      }
+
+      slug = decodeURIComponent(slug)
+        .replace(/[-_]+/g, ' ')
+        .replace(/\.(html|htm|php|asp|aspx).*$/i, '')
+        .replace(/[0-9]{12,}/g, '')
+        .trim();
+
+      if (!slug) {
+        return this.toTitleCase(fallback || parsed.hostname.replace(/^www\./, ''));
+      }
+
+      return this.toTitleCase(slug).slice(0, 80);
+    } catch (error) {
+      return fallback || url;
+    }
+  }
+
+  static toTitleCase(str) {
+    if (!str) return '';
+    return str.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase());
+  }
+
+  static getHostname(url) {
+    try {
+      const parsed = new URL(url);
+      return parsed.hostname.replace(/^www\./, '');
+    } catch (error) {
+      return '';
+    }
   }
 
   /**
@@ -364,14 +493,15 @@ export class PriceComparison {
       const urls = this.extractUrlsFromDDG(html, 'ebay.com');
 
       // Extract prices from URLs
-      const prices = await this.extractPricesFromUrls(urls, 'ebay.com');
+      const { prices, comparables } = await this.extractPricesFromUrls(urls, 'ebay.com');
 
       return {
         prices,
         avgPrice: prices.length > 0 ? this.calculateAverage(prices) : null,
         median: this.calculateMedian(prices),
         count: prices.length,
-        source: 'ebay_sold'
+        source: 'ebay_sold',
+        comparables
       };
     } catch (error) {
       console.error('Error searching eBay sold listings:', error);
@@ -388,8 +518,94 @@ export class PriceComparison {
       avgPrice: null,
       median: null,
       count: 0,
-      source: 'ebay_sold'
+      source: 'ebay_sold',
+      comparables: []
     };
+  }
+
+
+  static extractAmazonListingSummaries(html) {
+    const listings = [];
+    const normalizedHtml = html.replace(/\u00A0/g, ' ');
+
+    try {
+      if (typeof DOMParser !== 'undefined') {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(normalizedHtml, 'text/html');
+
+        const resultNodes = doc.querySelectorAll('[data-component-type="s-search-result"]');
+        resultNodes.forEach(node => {
+          const linkEl = node.querySelector('a.a-link-normal.s-no-outline');
+          const priceEl = node.querySelector('.a-price > .a-offscreen');
+          const titleEl = node.querySelector('h2 a span');
+          const conditionEl = node.querySelector('.a-color-success');
+
+          const url = linkEl?.href;
+          const priceValue = this.extractPriceFromText(priceEl?.textContent || '');
+
+          if (url && priceValue) {
+            const entry = this.buildComparableEntry({
+              url,
+              priceValue,
+              site: 'amazon',
+              source: 'search-result',
+              title: titleEl?.textContent?.trim(),
+              condition: conditionEl?.textContent?.trim()
+            });
+
+            if (entry) {
+              listings.push(entry);
+            }
+          }
+        });
+      }
+    } catch (error) {
+      console.warn('[Amazon Comparables] DOM parsing failed:', error);
+    }
+
+    return this.dedupeComparables(listings);
+  }
+
+  static extractEbayListingSummaries(html) {
+    const listings = [];
+    const normalizedHtml = html.replace(/\u00A0/g, ' ');
+
+    try {
+      if (typeof DOMParser !== 'undefined') {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(normalizedHtml, 'text/html');
+
+        const resultNodes = doc.querySelectorAll('.s-item');
+        resultNodes.forEach(node => {
+          const linkEl = node.querySelector('a.s-item__link');
+          const priceEl = node.querySelector('.s-item__price');
+          const titleEl = node.querySelector('.s-item__title');
+          const conditionEl = node.querySelector('.SECONDARY_INFO');
+
+          const url = linkEl?.href;
+          const priceValue = this.extractPriceFromText(priceEl?.textContent || '');
+
+          if (url && priceValue) {
+            const entry = this.buildComparableEntry({
+              url,
+              priceValue,
+              site: 'ebay',
+              source: 'search-result',
+              title: titleEl?.textContent?.trim(),
+              condition: conditionEl?.textContent?.trim()
+            });
+
+            if (entry) {
+              listings.push(entry);
+            }
+          }
+        });
+      }
+    } catch (error) {
+      console.warn('[eBay Comparables] DOM parsing failed:', error);
+    }
+
+    return this.dedupeComparables(listings);
   }
 
 
@@ -604,7 +820,8 @@ export class PriceComparison {
       max: null,
       compCount: 0,
       currentPrice: null,
-      source: null
+      source: null,
+      comparables: []
     };
   }
 }
