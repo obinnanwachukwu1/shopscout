@@ -7,6 +7,28 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const isWatch = process.argv.includes('--watch');
+const optionalLocalConfigPlugin = {
+  name: 'optional-local-config',
+  setup(build) {
+    build.onResolve({ filter: /config\.local\.js$/ }, args => {
+      const configPath = path.resolve(args.resolveDir, args.path);
+
+      if (fs.existsSync(configPath)) {
+        return { path: configPath };
+      }
+
+      return {
+        path: 'config.local.js',
+        namespace: 'optional-local-config'
+      };
+    });
+
+    build.onLoad({ filter: /.*/, namespace: 'optional-local-config' }, () => ({
+      contents: 'export const CLAUDE_API_KEY = "";',
+      loader: 'js'
+    }));
+  }
+};
 
 // Clean dist directory
 if (fs.existsSync('dist')) {
@@ -20,7 +42,8 @@ const buildConfig = {
   format: 'esm',
   target: 'es2020',
   sourcemap: true,
-  logLevel: 'info'
+  logLevel: 'info',
+  plugins: [optionalLocalConfigPlugin]
 };
 
 // Build background.js
